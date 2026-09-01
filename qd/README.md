@@ -19,6 +19,7 @@ qd/
 ├── play_elite.py      inspect / replay one elite from a saved archive
 ├── check_harness.py   physics sanity checks — run before any long run
 ├── bench.py           throughput + evaluation-noise benchmark: pick a batch size
+├── survival_report.py   re-evaluate the top elites: how long do they stay upright?
 ├── compare_archives.py  side-by-side CPG vs PGA-ME comparison
 └── pga/               Phase 3: PGA-MAP-Elites (see below)
 ```
@@ -28,6 +29,15 @@ Before the first long run on a new machine or after touching the MJCF:
 ```bash
 uv run python -m qd.check_harness   # standing height, time-to-topple, descriptor spread
 uv run python -m qd.bench           # ms/genome vs batch size, fitness noise
+```
+
+After a run, to see whether the elites actually *walk* rather than just score
+well — the pro-rata penalty means a high fitness can come either from covering
+ground fast before falling or from staying up, and the archive does not record
+which:
+
+```bash
+uv run python -m qd.survival_report --archive logs/qd/map_elites/archive_final.npz
 ```
 
 ## Install

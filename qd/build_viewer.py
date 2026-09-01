@@ -14,9 +14,11 @@ Pass two manifests to get an archive switcher (Phase 2 vs Phase 3).
 
 **Why only some cells carry a clip.** Everything is inlined as a data: URI
 because a published artifact cannot fetch external media, and the page has a
-hard 16 MB ceiling. ``--budget-mb`` fills that ceiling deliberately: the top
-elites by fitness first, then a spatial sweep across the descriptor space so
-every region of the archive is represented. Cells without an embedded clip stay
+hard 16 MB ceiling. ``--budget-mb`` fills that ceiling deliberately: every
+elite that survived the full episode first (those are the rarest and most
+informative gaits, and they are *not* the highest-scoring ones), then the top
+elites by fitness, then a spatial sweep across the descriptor space so every
+region of the archive is represented. Cells without an embedded clip stay
 clickable and show their stats plus the path to the full-resolution file on
 disk, which ``qd.render_gaits`` wrote for *every* filled cell.
 """
@@ -49,15 +51,30 @@ class Args:
 
 
 def _select_clips(entries: list[dict], budget_bytes: float, top: int) -> set[int]:
-    """Rows to embed: the best elites, then a spread over the descriptor space.
+    """Rows to embed: survivors, then the best elites, then a spatial spread.
 
-    The spatial pass walks cells in order of distance from the already-chosen
-    set, so coverage fills in evenly instead of clustering near the peak.
+    Survivors come FIRST regardless of fitness. On this robot almost nothing
+    stays upright for the whole episode, so those clips are the most
+    informative ones in the archive — and they are not the highest-scoring, so
+    a purely fitness-ranked selection drops exactly the gaits a reader most
+    needs to see. The spatial pass then walks cells in order of distance from
+    the already-chosen set, so coverage fills in evenly instead of clustering
+    near the peak.
     """
-    by_fitness = sorted(entries, key=lambda e: -e["archived_fitness"])
     chosen: list[dict] = []
     used = 0.0
+    for entry in sorted(
+        (e for e in entries if e.get("survived")), key=lambda e: -e["displacement_m"]
+    ):
+        if used + entry["bytes"] > budget_bytes:
+            break
+        chosen.append(entry)
+        used += entry["bytes"]
+
+    by_fitness = sorted(entries, key=lambda e: -e["archived_fitness"])
     for entry in by_fitness[:top]:
+        if entry in chosen:
+            continue
         if used + entry["bytes"] > budget_bytes:
             break
         chosen.append(entry)

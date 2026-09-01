@@ -451,9 +451,17 @@ is CPU-side.
 
 Clips inline as data: URIs, because a published artifact cannot fetch external
 media and the page has a 16 MB ceiling. `--budget-mb` fills it deliberately:
-top elites by fitness first, then a spatial sweep across the descriptor space.
-Every filled cell is still rendered to disk at full resolution, and cells
-without an embedded clip stay clickable, showing their stats and the file path.
+**every elite that survived the full episode first**, then the top elites by
+fitness, then a spatial sweep across the descriptor space. Survivors lead
+because they are the rarest thing in either archive — one gait out of 632 — and
+they are *not* the highest-scoring, so a fitness-ranked selection drops exactly
+the clip a reader most needs to see. Every filled cell is still rendered to disk
+at full resolution, and cells without an embedded clip stay clickable, showing
+their stats and the file path.
+
+The one survivor sits at cell (18, 19) — both feet on the ground ~95% of the
+episode. Watching it is the fastest way to understand the headline: it is
+standing, with a shuffle.
 
 ## Comparing the two archives
 

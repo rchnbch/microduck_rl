@@ -328,8 +328,21 @@ qd/pga/
 ```
 
 ```bash
-uv run python -m qd.pga.run_pga_me --iterations 200 --batch-size 100
+# smoke test first
+uv run python -m qd.pga.run_pga_me --iterations 2 --batch-size 8 \
+    --initial-solutions 16 --out-dir logs/qd/pga_smoke
+
+# the run the Results table reports: ~207k evaluations, budget-matched to the
+# MAP-Elites run above so the two archives can be compared at all
+uv run python -m qd.pga.run_pga_me --iterations 200 --batch-size 1024 \
+    --initial-solutions 2048 --td3.replay-buffer-size 2000000 \
+    --out-dir logs/qd/pga_me_matched
 ```
+
+A bigger batch costs little (the rollout loop dominates) but fills the replay
+buffer far faster — 1024 worlds produce ~358k transitions per iteration, so the
+default 1e6 buffer turns over every three iterations and the critic only ever
+sees a narrow recency window. Hence `--td3.replay-buffer-size 2000000` here.
 
 ### Genome — a closed-loop MLP
 
@@ -425,6 +438,8 @@ run.
 # render every filled cell to mp4 (needs the MUJOCO_GL prefix — see below)
 MUJOCO_GL=glfw uv run python -m qd.render_gaits \
     --archive logs/qd/map_elites/archive_final.npz --out logs/qd/gaits/cpg
+MUJOCO_GL=glfw uv run python -m qd.render_gaits \
+    --archive logs/qd/pga_me_matched/archive_final.npz --out logs/qd/gaits/pga
 
 # build the clickable page
 uv run python -m qd.build_viewer \
@@ -468,7 +483,7 @@ standing, with a shuffle.
 ```bash
 uv run python -m qd.compare_archives \
     --a logs/qd/map_elites/archive_final.npz --a-label "MAP-Elites (CPG)" \
-    --b logs/qd/pga_me/archive_final.npz     --b-label "PGA-ME (MLP)" \
+    --b logs/qd/pga_me_matched/archive_final.npz --b-label "PGA-ME (MLP)" \
     --out logs/qd/comparison
 ```
 

@@ -10,7 +10,7 @@ optimism gap made explicit.
 
     uv run python -m qd.compare_archives \\
         --a logs/qd/map_elites/archive_final.npz --a-label "MAP-Elites (CPG)" \\
-        --b logs/qd/pga_me/archive_final.npz     --b-label "PGA-ME (MLP)" \\
+        --b logs/qd/pga_me_matched/archive_final.npz --b-label "PGA-ME (MLP)" \\
         --out logs/qd/comparison
 
 Pass ``--no-replay`` to skip re-evaluation and compare archived values only —

@@ -233,6 +233,85 @@ interleaves neck/head between the legs, so a hard-coded `0..9` slice grabs the
 head), the two-layer bound enforcement, the fall latch, and the descriptor
 staying inside `[0, 1]²` where the `GridArchive` can see it.
 
+## Results
+
+Both pipelines run to **~207,000 evaluations** on one RTX 3060 (MAP-Elites
+206,848 in 31 min; PGA-ME 207,048 in 74 min), same archive, same objective,
+same descriptor, same deterministic-actuator physics.
+
+**Every number in the "honest" block is a re-evaluation.** MAP-Elites stores the
+luckiest sample per cell and this simulator is not bit-reproducible, so archived
+fitness is biased upward — by +0.002 m for the CPG and **+0.133 m for the MLP**,
+a 60× difference (see "Reproducibility"). Comparing the two archives on archived
+values would have handed PGA-ME a 3.3× win on peak fitness that does not survive
+re-running the genomes. Reproduce with
+`uv run python -m qd.compare_archives --a ... --b ...`.
+
+| metric | MAP-Elites (CPG) | PGA-ME (MLP) |
+| --- | --- | --- |
+| **Honest — every elite re-evaluated** | | |
+| best-cell fitness | +0.143 m | **+0.212 m** |
+| QD-score | **1679.8** | 1441.4 |
+| mean fitness | −0.059 m | −0.064 m |
+| positive-fitness elites | 67 | **84** |
+| survived the full 7 s | 0 | **1** |
+| longest upright | 2.10 s | **7.00 s** |
+| median upright | 0.80 s | **1.04 s** |
+| furthest travelled | +0.339 m | **+0.403 m** |
+| **furthest by a survivor** | **—** | **+0.088 m** |
+| *Archived — optimistic, for reference* | | |
+| archived best-cell fitness | +0.153 m | +0.504 m |
+| archived QD-score | 1680.6 | 1480.4 |
+| archive optimism (mean) | +0.002 m | +0.133 m |
+| **Structure** | | |
+| elites | 340 | 292 |
+| coverage | 85.0% | 73.0% |
+| cells the other never reached | 48 | 0 |
+
+![archive comparison](../logs/qd/comparison/comparison.png)
+
+### The headline: it balances, or it travels — never both
+
+**The single policy that stays upright for the full 7 s covers 8.8 cm.** That is
+1.3 cm/s, about a third of a body length in the whole episode — standing still
+with extra steps. The elite that travels furthest (+0.403 m) falls before the
+episode ends. Nothing in either archive both stays up and goes anywhere.
+
+That is the real state of this work, and it is worth stating plainly because
+every aggregate metric above hides it: fitness rewards distance *and* staying
+up, so a high score can come from either, and only the survivor-displacement row
+separates them.
+
+### What PGA-ME won and lost
+
+**Won: peak quality and the ability to stay upright at all.** Best-cell fitness
++0.212 m vs +0.143 m, 84 positive-fitness elites vs 67, and — the qualitative
+difference — 561 full-episode survivors across the run against **zero, ever**,
+for the CPG. A passive HOME hold topples at 1.34 s; the open-loop CPG stretches
+that to 2.10 s and no further, because an open-loop genome has no feedback and
+*structurally cannot* correct a topple. A closed-loop policy can, and does.
+
+**Lost: coverage and QD-score.** 73.0% vs 85.0%, and QD 1441 vs 1680. The
+archive is also visibly noisier — the replay heatmap is speckled with dark cells
+where the CPG's is smooth, which is the reactivity amplifying simulator
+non-determinism, rendered as an image. And 48 cells that the CPG filled were
+never reached by PGA-ME, while PGA-ME reached none the CPG missed.
+
+So against the acceptance criterion — *match or beat on QD-score **and**
+best-cell fitness* — PGA-ME **beats on best-cell fitness and loses on
+QD-score**, at matched budget. Not a clean win, and the two are good at
+different things: gradient variation concentrates quality where the critic can
+find it, and pays for that in exploration.
+
+### Per-operator insertion rates
+
+Logged every iteration (`history.json`) and averaged in `summary.json`. Over the
+matched run: **GA 3.7%, PG 1.8%**, greedy actor inserted 3 times. Both operators
+contribute — PG is not the ~zero that would mean the critic or the reward wiring
+is broken. Both start far higher (PG 95% at iteration 2) and decay together as
+the archive saturates, which is the expected shape; PG runs at roughly half GA's
+rate throughout.
+
 ## Phase 3 — PGA-MAP-Elites (`qd/pga/`)
 
 Same 20×20 duty-factor archive, same objective, same behaviour descriptor. What

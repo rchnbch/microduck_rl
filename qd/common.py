@@ -291,6 +291,28 @@ def plot_archive(
     return path
 
 
+def survival_summary(info: dict[str, np.ndarray], control_dt: float) -> dict[str, float]:
+    """Survival statistics for one evaluated batch.
+
+    On this robot the headline question is not QD-score but **whether anything
+    stays upright for the whole episode** — a passive HOME hold topples at
+    ~1.34 s, so "fitness went up" can mean "fell slightly later" rather than
+    "walked". Every run logs these per generation so that distinction is
+    visible in ``history.json`` without re-evaluating the archive.
+    """
+    survival = info["survival_fraction"]
+    upright_s = info["alive_steps"] * control_dt
+    return {
+        "fell_fraction": float(np.mean(info["fell"])),
+        "survived_full_episode": int((~info["fell"]).sum()),
+        "mean_survival_fraction": float(survival.mean()),
+        "max_survival_fraction": float(survival.max()),
+        "mean_upright_s": float(upright_s.mean()),
+        "max_upright_s": float(upright_s.max()),
+        "max_displacement_m": float(info["displacement"].max()),
+    }
+
+
 def write_json(path: str | Path, payload: Any) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

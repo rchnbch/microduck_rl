@@ -27,6 +27,7 @@ from qd.common import (
     make_archive,
     plot_archive,
     save_archive,
+    survival_summary,
     write_json,
 )
 from qd.evaluate import CpgEvaluator, HarnessCfg, MicroduckRolloutHarness
@@ -73,11 +74,15 @@ class Args:
     so every insertable elite contributes a non-negative amount."""
 
 
-def _log_row(gen: int, stats: dict[str, float], evals: int, elapsed: float) -> str:
+def _log_row(
+    gen: int, stats: dict[str, float], evals: int, surv: dict, elapsed: float
+) -> str:
     return (
         f"gen {gen:4d} | evals {evals:6d} | elites {int(stats['num_elites']):4d} "
         f"| coverage {stats['coverage'] * 100:5.1f}% | QD {stats['qd_score']:9.2f} "
-        f"| best {stats['obj_max']:+.3f} m | {elapsed:6.1f}s"
+        f"| best {stats['obj_max']:+.3f} m "
+        f"| upright max {surv['max_upright_s']:5.2f}s survived {surv['survived_full_episode']:4d} "
+        f"| {elapsed:6.1f}s"
     )
 
 
@@ -115,13 +120,14 @@ def main(args: Args | None = None) -> None:
     archive.add(init, fitness, measures)
     evals = len(init)
     stats = archive_stats(archive)
-    print(_log_row(0, stats, evals, time.perf_counter() - t_start), flush=True)
+    surv = survival_summary(info, harness.control_dt)
+    print(_log_row(0, stats, evals, surv, time.perf_counter() - t_start), flush=True)
     history.append(
         {
             "generation": 0,
             "evaluations": evals,
-            "fell_fraction": float(np.mean(info["fell"])),
             "elapsed_s": time.perf_counter() - t_start,
+            **surv,
             **stats,
         }
     )
@@ -149,17 +155,18 @@ def main(args: Args | None = None) -> None:
         evals += len(solutions)
 
         stats = archive_stats(archive)
+        surv = survival_summary(info, harness.control_dt)
         elapsed = time.perf_counter() - t_start
         history.append(
             {
                 "generation": gen,
                 "evaluations": evals,
-                "fell_fraction": float(np.mean(info["fell"])),
                 "elapsed_s": elapsed,
+                **surv,
                 **stats,
             }
         )
-        print(_log_row(gen, stats, evals, elapsed), flush=True)
+        print(_log_row(gen, stats, evals, surv, elapsed), flush=True)
 
         if args.checkpoint_every and gen % args.checkpoint_every == 0:
             save_archive(archive, out / f"archive_gen{gen:04d}.npz", _meta(args, gen, evals))
@@ -176,6 +183,10 @@ def main(args: Args | None = None) -> None:
             "solution_dim": space.dim,
             "evaluations": evals,
             "wall_clock_s": time.perf_counter() - t_start,
+            "best_upright_s": max(h["max_upright_s"] for h in history),
+            "total_full_episode_survivors": int(
+                sum(h["survived_full_episode"] for h in history)
+            ),
             "args": args,
             **archive_stats(archive),
         },

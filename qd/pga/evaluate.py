@@ -200,7 +200,7 @@ class PolicyRolloutHarness:
     # -- rollout ------------------------------------------------------------- #
 
     def rollout(
-        self, genomes: torch.Tensor, collect: bool = True
+        self, genomes: torch.Tensor, collect: bool = True, recorder=None
     ) -> tuple[np.ndarray, np.ndarray, dict, Transitions | None]:
         """Evaluate one genome per world and optionally collect transitions.
 
@@ -229,9 +229,11 @@ class PolicyRolloutHarness:
         zero_action = torch.zeros(
             self.num_envs, self.spec.action_dim, device=self.device
         )
-        for _ in range(settle_steps):
+        for k in range(settle_steps):
             obs_dict = self.env.step(zero_action)[0]
             obs = obs_dict["actor"]
+            if recorder is not None:
+                recorder("settle", k)
 
         metrics = RolloutMetrics(self.num_envs, fit, self.device)
         metrics.begin(self.base_pos())
@@ -264,6 +266,8 @@ class PolicyRolloutHarness:
                 )
                 buf.append((obs, action, reward, next_obs, just_fell.float(), was_alive))
             obs = next_obs
+            if recorder is not None:
+                recorder("episode", step)
 
         fitness, measures, info = metrics.finalize()
         transitions = None

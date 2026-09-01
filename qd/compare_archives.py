@@ -1,27 +1,32 @@
 """Side-by-side comparison of two archives (vanilla CPG vs PGA-ME).
 
-Both pipelines write the same ``archive_*.npz`` format over the same 20x20
-duty-factor grid with the same objective, so they are directly comparable on
-the three numbers that matter for QD: **coverage** (how much of the behaviour
-space was filled), **QD-score** (total quality summed over filled cells), and
-**best-cell fitness** (peak quality). Produces one figure with both heatmaps on
-a shared colour scale plus a difference map, and a markdown table.
+**Leads with replay numbers, not archived ones.** MAP-Elites keeps the luckiest
+sample per cell and this simulator is not bit-reproducible, so archived fitness
+is biased upward — and by a genome-dependent amount (see :mod:`qd.replay`).
+Ranking two archives from different genome classes on their archived values is
+therefore invalid, so every elite of both archives is re-evaluated here and the
+table leads with what came back. Archived values are shown underneath, with the
+optimism gap made explicit.
 
     uv run python -m qd.compare_archives \\
         --a logs/qd/map_elites/archive_final.npz --a-label "MAP-Elites (CPG)" \\
         --b logs/qd/pga_me/archive_final.npz     --b-label "PGA-ME (MLP)" \\
         --out logs/qd/comparison
+
+Pass ``--no-replay`` to skip re-evaluation and compare archived values only —
+valid when both archives use the *same* genome, and misleading otherwise.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import tyro
 
-from qd.common import MEASURE_NAMES, load_archive, write_json
+from qd.common import MEASURE_NAMES, FitnessCfg, load_archive, write_json
+from qd.replay import infer_kind, reevaluate
 
 
 @dataclass
@@ -31,32 +36,77 @@ class Args:
     out: Path = Path("logs/qd/comparison")
     a_label: str = "MAP-Elites (CPG)"
     b_label: str = "PGA-ME (MLP)"
+
+    replay: bool = True
+    """Re-evaluate every elite. Off compares archived values only."""
+
     qd_score_offset: float = -5.0
     """Must match the runs' offset, or the QD-scores are not comparable."""
 
+    device: str = "cuda:0"
+    max_envs: int = 512
+    fitness: FitnessCfg = field(default_factory=FitnessCfg)
 
-def _grid(data: dict) -> np.ndarray:
-    """Dense ``(rows, cols)`` fitness grid; empty cells are NaN."""
-    dims = tuple(int(x) for x in data["grid_dims"])
+
+def _grid(dims: tuple[int, int], index: np.ndarray, values: np.ndarray) -> np.ndarray:
     grid = np.full(dims, np.nan)
-    rows, cols = np.unravel_index(data["index"].astype(int), dims)
-    grid[rows, cols] = data["objective"]
+    rows, cols = np.unravel_index(index.astype(int), dims)
+    grid[rows, cols] = values
     return grid
 
 
-def summarize(data: dict, offset: float) -> dict:
-    grid = _grid(data)
-    obj = data["objective"]
-    total_cells = grid.size
-    return {
-        "cells": total_cells,
-        "elites": len(obj),
-        "coverage": float(len(obj) / total_cells),
-        "qd_score": float(np.sum(obj - offset)),
-        "best_fitness": float(obj.max()),
-        "mean_fitness": float(obj.mean()),
-        "positive_fitness_elites": int((obj > 0).sum()),
+def _measure(data: dict, args: Args, label: str) -> dict:
+    """Archived + (optionally) replayed statistics for one archive."""
+    dims = tuple(int(x) for x in data["grid_dims"])
+    archived = data["objective"]
+    total_cells = dims[0] * dims[1]
+
+    out = {
+        "label": label,
+        "genome": infer_kind(data["solution"]),
+        "elites": len(archived),
+        "coverage": len(archived) / total_cells,
+        "archived_qd_score": float(np.sum(archived - args.qd_score_offset)),
+        "archived_best": float(archived.max()),
+        "archived_mean": float(archived.mean()),
     }
+
+    if not args.replay:
+        out["grid"] = _grid(dims, data["index"], archived)
+        return out
+
+    print(f"  re-evaluating {len(archived)} elites of {label}...", flush=True)
+    fitness, measures, info, control_dt = reevaluate(
+        data["solution"], out["genome"], args.fitness, args.device, args.max_envs
+    )
+    del measures
+    upright_s = info["alive_steps"] * control_dt
+    survived = ~info["fell"]
+
+    out.update(
+        {
+            "replay_qd_score": float(np.sum(fitness - args.qd_score_offset)),
+            "replay_best": float(fitness.max()),
+            "replay_mean": float(fitness.mean()),
+            "replay_positive_elites": int((fitness > 0).sum()),
+            "survived_full_episode": int(survived.sum()),
+            "max_upright_s": float(upright_s.max()),
+            "median_upright_s": float(np.median(upright_s)),
+            "max_displacement_m": float(info["displacement"].max()),
+            # Distance covered by the elites that actually stayed up — the test
+            # of "balances but barely locomotes".
+            "max_displacement_of_survivors_m": (
+                float(info["displacement"][survived].max()) if survived.any() else None
+            ),
+            "median_displacement_of_survivors_m": (
+                float(np.median(info["displacement"][survived])) if survived.any() else None
+            ),
+            "archive_optimism_mean": float(np.mean(archived - fitness)),
+            "archive_optimism_median": float(np.median(archived - fitness)),
+            "grid": _grid(dims, data["index"], fitness),
+        }
+    )
+    return out
 
 
 def main(args: Args | None = None) -> None:
@@ -66,18 +116,14 @@ def main(args: Args | None = None) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    a, b = load_archive(args.a), load_archive(args.b)
-    grid_a, grid_b = _grid(a), _grid(b)
-    if grid_a.shape != grid_b.shape:
-        raise ValueError(
-            f"archives use different grids ({grid_a.shape} vs {grid_b.shape}); "
-            "they are not comparable"
-        )
+    a_data, b_data = load_archive(args.a), load_archive(args.b)
+    if list(a_data["grid_dims"]) != list(b_data["grid_dims"]):
+        raise ValueError("archives use different grids; they are not comparable")
 
-    stats = {
-        args.a_label: summarize(a, args.qd_score_offset),
-        args.b_label: summarize(b, args.qd_score_offset),
-    }
+    a = _measure(a_data, args, args.a_label)
+    b = _measure(b_data, args, args.b_label)
+    grid_a, grid_b = a.pop("grid"), b.pop("grid")
+    basis = "replay" if args.replay else "archived"
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -86,78 +132,82 @@ def main(args: Args | None = None) -> None:
     vmax = float(np.nanmax([np.nanmax(grid_a), np.nanmax(grid_b)]))
     extent = (0.0, 1.0, 0.0, 1.0)
 
-    fig, axes = plt.subplots(1, 3, figsize=(16.5, 4.8), dpi=140)
-    for ax, grid, label in (
-        (axes[0], grid_a, args.a_label),
-        (axes[1], grid_b, args.b_label),
-    ):
-        im = ax.imshow(
-            grid.T, origin="lower", extent=extent, vmin=vmin, vmax=vmax,
-            cmap="viridis", aspect="equal",
-        )
-        s = stats[label]
+    fig, axes = plt.subplots(1, 3, figsize=(16.5, 4.9), dpi=140)
+    for ax, grid, s in ((axes[0], grid_a, a), (axes[1], grid_b, b)):
+        im = ax.imshow(grid.T, origin="lower", extent=extent, vmin=vmin, vmax=vmax,
+                       cmap="viridis", aspect="equal")
         ax.set_title(
-            f"{label}\ncoverage {s['coverage'] * 100:.1f}%  "
-            f"QD {s['qd_score']:.0f}  best {s['best_fitness']:+.3f} m"
+            f"{s['label']} — {basis} fitness\n"
+            f"coverage {s['coverage'] * 100:.1f}%  "
+            f"QD {s[basis + '_qd_score']:.0f}  best {s[basis + '_best']:+.3f} m"
         )
         ax.set_xlabel(MEASURE_NAMES[0].replace("_", " "))
         ax.set_ylabel(MEASURE_NAMES[1].replace("_", " "))
         fig.colorbar(im, ax=ax, label="fitness [m]")
 
-    # Difference map: where does B beat A? NaN-aware, so a cell only one
-    # pipeline filled still shows up.
     filled_a, filled_b = ~np.isnan(grid_a), ~np.isnan(grid_b)
-    diff = np.where(filled_b, np.nan_to_num(grid_b, nan=0.0), np.nan) - np.where(
-        filled_a, np.nan_to_num(grid_a, nan=0.0), 0.0
+    diff = np.where(filled_b, np.nan_to_num(grid_b), np.nan) - np.where(
+        filled_a, np.nan_to_num(grid_a), 0.0
     )
     lim = float(np.nanmax(np.abs(diff))) if np.any(~np.isnan(diff)) else 1.0
-    im = axes[2].imshow(
-        diff.T, origin="lower", extent=extent, vmin=-lim, vmax=lim,
-        cmap="RdBu_r", aspect="equal",
-    )
+    im = axes[2].imshow(diff.T, origin="lower", extent=extent, vmin=-lim, vmax=lim,
+                        cmap="RdBu_r", aspect="equal")
     only_b = int(np.sum(filled_b & ~filled_a))
     only_a = int(np.sum(filled_a & ~filled_b))
-    axes[2].set_title(
-        f"{args.b_label} - {args.a_label}\n"
-        f"{only_b} cells only in B, {only_a} only in A"
-    )
+    axes[2].set_title(f"{b['label']} − {a['label']}\n"
+                      f"{only_b} cells only in B, {only_a} only in A")
     axes[2].set_xlabel(MEASURE_NAMES[0].replace("_", " "))
     axes[2].set_ylabel(MEASURE_NAMES[1].replace("_", " "))
     fig.colorbar(im, ax=axes[2], label="fitness delta [m]")
-
     fig.tight_layout()
-    fig_path = out / "comparison.png"
-    fig.savefig(fig_path)
+    fig.savefig(out / "comparison.png")
     plt.close(fig)
 
     both = filled_a & filled_b
-    stats["shared_cells"] = int(both.sum())
-    stats["cells_only_in_b"] = only_b
-    stats["cells_only_in_a"] = only_a
-    stats["mean_delta_on_shared_cells"] = (
-        float(np.mean(grid_b[both] - grid_a[both])) if both.any() else None
-    )
-    write_json(out / "comparison.json", stats)
+    payload = {
+        "basis": basis,
+        a["label"]: a,
+        b["label"]: b,
+        "shared_cells": int(both.sum()),
+        "cells_only_in_b": only_b,
+        "cells_only_in_a": only_a,
+        "mean_delta_on_shared_cells": (
+            float(np.mean(grid_b[both] - grid_a[both])) if both.any() else None
+        ),
+    }
+    write_json(out / "comparison.json", payload)
 
-    rows = [args.a_label, args.b_label]
-    print(f"\n| metric | {rows[0]} | {rows[1]} |")
+    rows = [
+        ("HONEST — every elite re-evaluated", None, None),
+        ("best-cell fitness", "replay_best", "{:+.4f} m"),
+        ("QD-score", "replay_qd_score", "{:.1f}"),
+        ("mean fitness", "replay_mean", "{:+.4f} m"),
+        ("positive-fitness elites", "replay_positive_elites", "{:d}"),
+        ("survived the full episode", "survived_full_episode", "{:d}"),
+        ("longest upright", "max_upright_s", "{:.2f} s"),
+        ("median upright", "median_upright_s", "{:.2f} s"),
+        ("furthest travelled", "max_displacement_m", "{:+.3f} m"),
+        ("furthest by a survivor", "max_displacement_of_survivors_m", "{:+.3f} m"),
+        ("median travel of survivors", "median_displacement_of_survivors_m", "{:+.3f} m"),
+        ("ARCHIVED — optimistic, shown for reference", None, None),
+        ("archived best-cell fitness", "archived_best", "{:+.4f} m"),
+        ("archived QD-score", "archived_qd_score", "{:.1f}"),
+        ("archive optimism (mean)", "archive_optimism_mean", "{:+.4f} m"),
+        ("STRUCTURE", None, None),
+        ("elites", "elites", "{:d}"),
+        ("coverage", "coverage", "{:.1%}"),
+    ]
+    print(f"\n| metric | {a['label']} | {b['label']} |")
     print("| --- | --- | --- |")
-    for key, fmt in (
-        ("elites", "{:d}"), ("coverage", "{:.1%}"), ("qd_score", "{:.1f}"),
-        ("best_fitness", "{:+.4f} m"), ("mean_fitness", "{:+.4f} m"),
-        ("positive_fitness_elites", "{:d}"),
-    ):
-        print(
-            f"| {key.replace('_', ' ')} | "
-            + " | ".join(fmt.format(stats[r][key]) for r in rows)
-            + " |"
-        )
-    print(f"\ncells only in {rows[1]}: {only_b} | only in {rows[0]}: {only_a} "
+    for name, key, fmt in rows:
+        if key is None:
+            print(f"| **{name}** | | |")
+            continue
+        cells = ["—" if s.get(key) is None else fmt.format(s[key]) for s in (a, b)]
+        print(f"| {name} | {cells[0]} | {cells[1]} |")
+    print(f"\ncells only in {b['label']}: {only_b} | only in {a['label']}: {only_a} "
           f"| shared: {int(both.sum())}")
-    if stats["mean_delta_on_shared_cells"] is not None:
-        print(f"mean fitness delta on shared cells: "
-              f"{stats['mean_delta_on_shared_cells']:+.4f} m")
-    print(f"\nwrote {fig_path} and {out / 'comparison.json'}")
+    print(f"wrote {out / 'comparison.png'} and {out / 'comparison.json'}")
 
 
 if __name__ == "__main__":

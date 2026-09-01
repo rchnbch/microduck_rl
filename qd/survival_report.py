@@ -19,6 +19,7 @@ import numpy as np
 import tyro
 
 from qd.common import FitnessCfg, load_archive, write_json
+from qd.replay import infer_kind, reevaluate
 
 
 @dataclass
@@ -43,27 +44,10 @@ def main(args: Args | None = None) -> None:
 
     kind = args.genome
     if kind == "auto":
-        kind = "cpg" if batch.shape[1] < 100 else "mlp"
-
-    if kind == "cpg":
-        from qd.evaluate import CpgEvaluator, HarnessCfg, MicroduckRolloutHarness
-
-        harness = MicroduckRolloutHarness(
-            HarnessCfg(num_envs=len(batch), device=args.device), args.fitness
-        )
-        fitness, measures, info = CpgEvaluator(harness).evaluate(batch)
-        control_dt = harness.control_dt
-    else:
-        import torch
-
-        from qd.pga.evaluate import PolicyHarnessCfg, PolicyRolloutHarness
-
-        harness = PolicyRolloutHarness(
-            PolicyHarnessCfg(num_envs=len(batch), device=args.device), args.fitness
-        )
-        genomes = torch.as_tensor(batch, dtype=torch.float32, device=args.device)
-        fitness, measures, info, _ = harness.rollout(genomes, collect=False)
-        control_dt = harness.control_dt
+        kind = infer_kind(batch)
+    fitness, measures, info, control_dt = reevaluate(
+        batch, kind, args.fitness, args.device, max_envs=len(batch)
+    )
 
     total_steps = round(args.fitness.episode_seconds / control_dt)
     survival = info["survival_fraction"]

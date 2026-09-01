@@ -81,6 +81,14 @@ def main(args: Args | None = None) -> None:
             f"{bool(survived[i])!s:>9} {measures[i, 0]:>7.3f} {measures[i, 1]:>7.3f}"
         )
 
+    # Archive optimism: MAP-Elites keeps the BEST sample per cell, and this sim
+    # is not bit-reproducible, so archived fitness is biased upward by whatever
+    # luck that cell got. The size of the bias is a property of the genome, not
+    # a constant — a closed-loop policy amplifies a contact-solve difference
+    # through its feedback loop, an open-loop CPG replays the same joint
+    # trajectory regardless — so it has to be measured per archive before two
+    # archives can be compared on fitness at all.
+    optimism = objective[order] - fitness
     summary = {
         "archive": str(args.archive),
         "genome": kind,
@@ -92,11 +100,23 @@ def main(args: Args | None = None) -> None:
         "max_displacement_m": float(info["displacement"].max()),
         "max_replay_fitness_m": float(fitness.max()),
         "mean_survival_fraction": float(survival.mean()),
+        "archived_best_m": float(objective[order].max()),
+        "mean_archive_optimism_m": float(optimism.mean()),
+        "median_archive_optimism_m": float(np.median(optimism)),
+        "max_archive_optimism_m": float(optimism.max()),
     }
     print(
         f"\nsurvived the full episode: {summary['survived_full_episode']}/{len(batch)}"
         f"  |  longest upright {summary['max_upright_seconds']:.2f} s"
         f"  |  furthest {summary['max_displacement_m']:+.3f} m"
+    )
+    print(
+        f"archive optimism (archived - replay): mean {optimism.mean():+.4f} m, "
+        f"median {np.median(optimism):+.4f} m, max {optimism.max():+.4f} m"
+    )
+    print(
+        f"best fitness: {objective[order].max():+.4f} m archived vs "
+        f"{fitness.max():+.4f} m on replay"
     )
     if args.out is not None:
         write_json(args.out, summary)

@@ -19,8 +19,10 @@ qd/
 ├── play_elite.py      inspect / replay one elite from a saved archive
 ├── check_harness.py   physics sanity checks — run before any long run
 ├── bench.py           throughput + evaluation-noise benchmark: pick a batch size
-├── survival_report.py   re-evaluate the top elites: how long do they stay upright?
+├── survival_report.py   re-evaluate the top elites: survival + archive optimism
 ├── compare_archives.py  side-by-side CPG vs PGA-ME comparison
+├── render_gaits.py      rollout -> mp4 clips of each elite's gait
+├── build_viewer.py      the clickable archive viewer page
 └── pga/               Phase 3: PGA-MAP-Elites (see below)
 ```
 
@@ -337,6 +339,42 @@ actor was inserted, and `summary.json` carries the run means. This is a
 correctness signal, not a curiosity: **PG insertions near zero means the critic
 or the reward wiring is broken**, and the fix is to debug it, not to ship the
 run.
+
+## Watching the gaits
+
+```bash
+# render every filled cell to mp4 (needs the MUJOCO_GL prefix — see below)
+MUJOCO_GL=glfw uv run python -m qd.render_gaits \
+    --archive logs/qd/map_elites/archive_final.npz --out logs/qd/gaits/cpg
+
+# build the clickable page
+uv run python -m qd.build_viewer \
+    --manifests logs/qd/gaits/cpg/manifest.json logs/qd/gaits/pga/manifest.json \
+    --labels "MAP-Elites" "PGA-ME" --out logs/qd/viewer/index.html
+```
+
+The page is a 20×20 heatmap you click: pick a cell and that elite's gait plays
+beside its fitness, duty factors, distance, time upright and outcome. Arrow keys
+step to the nearest *filled* cell, since the archive has holes. Two manifests
+give an archive switcher.
+
+**`MUJOCO_GL` must be set before Python starts** — MuJoCo resolves its GL
+backend at import time, so setting it in code is too late. On this WSL2 box
+`egl` fails (PyOpenGL finds no libEGL) and there is no OSMesa, but WSLg provides
+a real display, so `glfw` renders offscreen fine. Use `osmesa` on a genuinely
+headless machine.
+
+The clips are **not** a CPU re-simulation. Each elite is rolled out in the same
+batched MuJoCo-Warp harness that produced its archived fitness, with `qpos`
+logged every control step; rendering replays those exact poses through CPU
+MuJoCo. What you watch is the trajectory that was scored — only the rasteriser
+is CPU-side.
+
+Clips inline as data: URIs, because a published artifact cannot fetch external
+media and the page has a 16 MB ceiling. `--budget-mb` fills it deliberately:
+top elites by fitness first, then a spatial sweep across the descriptor space.
+Every filled cell is still rendered to disk at full resolution, and cells
+without an embedded clip stay clickable, showing their stats and the file path.
 
 ## Comparing the two archives
 

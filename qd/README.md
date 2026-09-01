@@ -18,7 +18,9 @@ qd/
 ├── run_map_elites.py  Phase 2 CLI: pyribs GridArchive + GaussianEmitter ask/tell loop
 ├── play_elite.py      inspect / replay one elite from a saved archive
 ├── check_harness.py   physics sanity checks — run before any long run
-└── bench.py           throughput + evaluation-noise benchmark: pick a batch size
+├── bench.py           throughput + evaluation-noise benchmark: pick a batch size
+├── compare_archives.py  side-by-side CPG vs PGA-ME comparison
+└── pga/               Phase 3: PGA-MAP-Elites (see below)
 ```
 
 Before the first long run on a new machine or after touching the MJCF:
@@ -218,6 +220,128 @@ against the actual model in the documented servo order (`Entity.joint_names`
 interleaves neck/head between the legs, so a hard-coded `0..9` slice grabs the
 head), the two-layer bound enforcement, the fall latch, and the descriptor
 staying inside `[0, 1]²` where the `GridArchive` can see it.
+
+## Phase 3 — PGA-MAP-Elites (`qd/pga/`)
+
+Same 20×20 duty-factor archive, same objective, same behaviour descriptor. What
+changes is the genome and how offspring are made — which is exactly what makes
+the two archives comparable.
+
+```
+qd/pga/
+├── policy_genome.py  MLP 61->64->64->14 (tanh), flattened to a 9038-param vector
+├── evaluate.py       batched rollout on the STRIPPED Velocity env + transition collection
+├── td3.py            replay buffer, twin critics, target nets, greedy actor
+├── variation.py      iso+lineDD directional GA variation, and PG variation
+└── run_pga_me.py     the iteration loop
+```
+
+```bash
+uv run python -m qd.pga.run_pga_me --iterations 200 --batch-size 100
+```
+
+### Genome — a closed-loop MLP
+
+`61 → 64 → 64 → 14`, tanh everywhere, flattened to **9038 parameters**. The 61
+inputs are the repo's shared observation contract (48 proprioception + the 13-D
+command block, commands pinned at zero), so an evolved policy stays compatible
+with the existing ONNX export and runtime. tanh on the *output* bounds actions
+to ±1 rad around HOME, which is both a sane range for this robot and what makes
+TD3 correct — target-policy smoothing needs a bounded action space to clip its
+noise against.
+
+A whole population is one `(P, 9038)` tensor and one batched forward
+(`einsum` over a per-policy weight axis), because a generation is evaluated in
+one rollout and PG variation trains ~50 offspring simultaneously.
+
+### Observations come from the real env, stripped
+
+Phase 2 drives mjlab's low-level `Scene`/`Simulation`; Phase 3 needs the 61-D
+observation pipeline and hand-rolling it is the mistake AGENTS.md warns about.
+So `qd/pga/evaluate.py` builds the actual `Mjlab-Velocity-Flat-MicroDuck` cfg
+and removes what a QD evaluation must not have:
+
+| removed | why |
+| --- | --- |
+| all 9 DR event terms | a genome must have one fitness |
+| observation corruption | same |
+| spawn jitter and random yaw | "+x displacement" is meaningless from a random heading |
+| all command ranges (→ 0) | the deployment idle state, and Phase 2's condition |
+| curricula | they re-widen the ranges that were just zeroed |
+| rewards, terminations | the rollout is fixed-length and scored by `qd.common` |
+
+`expand_bam_friction_fields` is deliberately **kept** — it is not DR but the
+per-world model-field expansion BAM cannot run without. A test asserts every
+event term in the velocity cfg is explicitly classified as one or the other, so
+a term added upstream fails loudly instead of leaving DR quietly on. The robot
+is also swapped for Phase 2's deterministic-actuator config, so both archives
+are measured under identical physics.
+
+### Per-step reward — an exact decomposition of the episodic fitness
+
+```
+r_t        = forward_velocity * dt                          while upright
+r_terminal = -fall_penalty * (steps_left / total_steps)     on the fall, done=1
+```
+
+Summed, this is `displacement - fall_penalty * fraction_of_episode_fallen` —
+*precisely* what the archive ranks on. That identity is the point: a critic
+trained on anything else would push PG variation somewhere the archive does not
+reward, and the symptom would be a PG insertion rate near zero. A test pins the
+two expressions together.
+
+Post-fall steps contribute no transitions, so the critic never learns from the
+frozen tail.
+
+### Variation
+
+**GA half — iso+lineDD** (Vassiliades & Mouret):
+
+```
+child = a + iso_sigma * N(0, I) + line_sigma * N(0, 1) * (b - a)
+```
+
+Phase 2's plain per-dimension Gaussian is fine on 31 CPG parameters and
+hopeless on 9038 MLP weights: a fixed sigma either barely moves the policy or
+destroys it. The line term mutates along the direction between two elites — a
+direction the archive has already shown to be productive — and is scale-free,
+so the step size adapts to how far apart the parents are.
+
+**PG half** copies random elites and takes `num_pg_training_steps` Adam steps on
+them to maximise the TD3 critic's Q. All offspring are stepped at once, each on
+its own independently sampled transition batch, mirroring QDax's vmapped
+emitter. The greedy actor is evaluated and inserted alongside them each
+iteration.
+
+Hyperparameters follow QDax's `pga_me` / `td3` defaults (consulted directly):
+`proportion_mutation_ga` 0.5, `num_critic_training_steps` 300,
+`num_pg_training_steps` 100, replay buffer 1e6, transition batch 256, critic and
+greedy-actor LR 3e-4, offspring policy LR 1e-3, `policy_noise` 0.2,
+`noise_clip` 0.5, `policy_delay` 2, `soft_tau_update` 0.005, discount 0.99,
+`iso_sigma` 0.005, `line_sigma` 0.05. Critic hidden layers are `(256, 256)`.
+
+### Per-operator insertion rates
+
+Every iteration logs `ga_insert_rate`, `pg_insert_rate` and whether the greedy
+actor was inserted, and `summary.json` carries the run means. This is a
+correctness signal, not a curiosity: **PG insertions near zero means the critic
+or the reward wiring is broken**, and the fix is to debug it, not to ship the
+run.
+
+## Comparing the two archives
+
+```bash
+uv run python -m qd.compare_archives \
+    --a logs/qd/map_elites/archive_final.npz --a-label "MAP-Elites (CPG)" \
+    --b logs/qd/pga_me/archive_final.npz     --b-label "PGA-ME (MLP)" \
+    --out logs/qd/comparison
+```
+
+Writes `comparison.png` — both heatmaps on a shared colour scale plus a
+difference map showing which cells each pipeline reached — and
+`comparison.json` with coverage, QD-score, best-cell fitness, and the mean
+fitness delta over the cells both filled. Pass the same `--qd-score-offset` the
+runs used, or the QD-scores are not comparable.
 
 ## Later upgrades (not built)
 

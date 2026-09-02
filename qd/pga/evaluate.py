@@ -33,7 +33,14 @@ import torch
 
 from qd.common import FitnessCfg, RolloutMetrics
 from qd.descriptors import DescriptorCfg
-from qd.evaluate import FEET_CONTACT_SENSOR, _deterministic_robot_cfg
+from qd.evaluate import (
+    FEET_CONTACT_SENSOR,
+    GROUND_CONTACT_SENSOR,
+    _deterministic_robot_cfg,
+    _ground_contact_sensor_cfg,
+    ground_contact_geoms,
+    resolve_contact_columns,
+)
 from qd.evaluate import HarnessCfg as _ActuatorCfg
 from qd.pga.policy_genome import DEFAULT_SPEC, PolicySpec
 
@@ -77,6 +84,13 @@ class PolicyHarnessCfg:
     everything is down there is nothing left worth simulating. The check needs
     a host sync, so it is not run every step — the comment on the transition
     buffer below explains what per-step syncing costs here."""
+
+    mode_channels: bool = False
+    """Build the per-geom ground-contact sensor and accumulate P2' features.
+
+    v4's gate reads contact *classes* — soles only / any shell / nothing —
+    which the velocity task's two-slot feet sensor cannot express. Off by
+    default so a v3 command line compiles the model v3 compiled."""
 
     full_gait_stats: bool = False
     """Read velocity / joint / actuator channels every step, whether or not the
@@ -157,7 +171,10 @@ class Transitions:
 
 
 def _stripped_velocity_env_cfg(
-    cfg_num_envs: int, spawn_height: float, full_collision: bool = True
+    cfg_num_envs: int,
+    spawn_height: float,
+    full_collision: bool = True,
+    contact_geoms=None,
 ):
     """The velocity env cfg with DR, commands, rewards and terminations removed."""
     from mjlab_microduck.tasks.microduck_velocity_env_cfg import (
@@ -173,6 +190,10 @@ def _stripped_velocity_env_cfg(
     cfg.scene.entities["robot"] = _deterministic_robot_cfg(
         _ActuatorCfg(full_collision=full_collision)
     )
+    if contact_geoms is not None:
+        cfg.scene.sensors = tuple(cfg.scene.sensors) + (
+            _ground_contact_sensor_cfg(contact_geoms.names),
+        )
 
     for name in DR_EVENT_TERMS:
         cfg.events.pop(name, None)
@@ -241,11 +262,19 @@ class PolicyRolloutHarness:
             cfg.full_gait_stats or self.descriptor.needs
         )
         self.spec = spec
+        self.contact_geoms = (
+            ground_contact_geoms(cfg.full_collision) if cfg.mode_channels else None
+        )
         env_cfg = _stripped_velocity_env_cfg(
-            cfg.num_envs, cfg.spawn_height, cfg.full_collision
+            cfg.num_envs, cfg.spawn_height, cfg.full_collision, self.contact_geoms
         )
         self.env = ManagerBasedRlEnv(env_cfg, device=cfg.device)
         self.robot = self.env.scene["robot"]
+        self.contact_columns = (
+            resolve_contact_columns(self.robot, self.contact_geoms)
+            if self.contact_geoms is not None
+            else None
+        )
 
         obs, _ = self.env.reset()
         actor_obs = obs["actor"]
@@ -301,6 +330,44 @@ class PolicyRolloutHarness:
             "qfrc_actuator": d.qfrc_actuator,
         }
 
+    def mode_channels(self) -> dict[str, torch.Tensor] | None:
+        """Per-geom ground contact plus the rates ``ModeStats`` folds in."""
+        if self.contact_columns is None:
+            return None
+        sensor = self.env.scene.sensors[GROUND_CONTACT_SENSOR].data
+        found = sensor.found
+        assert found is not None
+        n_geoms = len(self.contact_columns[0])
+        d = self.robot.data
+        out = {
+            "contact_found": found.reshape(self.num_envs, -1)[:, :n_geoms],
+            "ang_vel_w": d.root_link_ang_vel_w,
+            "lin_vel_w": d.root_link_lin_vel_w,
+        }
+        if sensor.force is not None:
+            out["contact_force"] = sensor.force.reshape(self.num_envs, -1, 3)[
+                :, :n_geoms
+            ]
+        return out
+
+    def make_mode_stats(self, windows):
+        """A :class:`qd.modes.ModeStats` wired to this harness's column order."""
+        from qd.modes import ModeStats
+
+        if self.contact_columns is None:
+            raise RuntimeError(
+                "harness was built without mode_channels; P2' has nothing to read"
+            )
+        names, feet, head = self.contact_columns
+        return ModeStats(
+            self.num_envs,
+            self.device,
+            windows,
+            num_contact_geoms=len(names),
+            foot_columns=feet,
+            head_columns=head,
+        )
+
     # -- rollout ------------------------------------------------------------- #
 
     def rollout(
@@ -310,6 +377,7 @@ class PolicyRolloutHarness:
         recorder=None,
         actor=None,
         on_step=None,
+        mode_stats=None,
     ) -> tuple[np.ndarray, np.ndarray, dict, Transitions | None]:
         """Evaluate one genome per world and optionally collect transitions.
 
@@ -369,6 +437,13 @@ class PolicyRolloutHarness:
             control_dt=self.control_dt,
         )
         metrics.begin(self.base_pos())
+        accel = None
+        if mode_stats is not None:
+            from qd.modes import VerticalAccel
+
+            mode_stats.begin(self.base_pos())
+            accel = VerticalAccel(self.num_envs, self.device, self.control_dt)
+            accel.begin(self.robot.data.root_link_lin_vel_w)
 
         # Collected as dense (T, N, ...) stacks and masked ONCE at the end.
         # Masking per step (`obs[was_alive]`) would make the output size depend
@@ -391,6 +466,17 @@ class PolicyRolloutHarness:
             metrics.update(
                 self.base_pos(), gravity, self.foot_contact(), self.gait_extras()
             )
+            if mode_stats is not None:
+                ch = self.mode_channels()
+                assert ch is not None and accel is not None
+                mode_stats.update(
+                    self.base_pos(),
+                    gravity,
+                    ch["contact_found"],
+                    ch["ang_vel_w"],
+                    trunk_az=accel.step(ch["lin_vel_w"]),
+                    contact_force=ch.get("contact_force"),
+                )
             alive = ~metrics.fallen
             just_fell = was_alive & ~alive
 
@@ -425,6 +511,8 @@ class PolicyRolloutHarness:
                 break
 
         fitness, measures, info = metrics.finalize()
+        if mode_stats is not None:
+            info.update(mode_stats.finalize().to_info())
         transitions = None
         if collect and buf:
             stacks = [torch.stack(t) for t in zip(*buf)]  # each (T, N, ...)

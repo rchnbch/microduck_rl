@@ -79,6 +79,21 @@ class FitnessCfg:
     min_fitness: float = -5.0
     """Floor applied to the objective; also catches non-finite sims."""
 
+    latch_fall: bool = True
+    """Stop counting an env once it is low or tilted past the thresholds above.
+
+    v1-v3's rule, and the right one while "upright" *is* the viability
+    predicate. **v4 sets this False.** Under P2' (:mod:`qd.modes`) a crawl
+    spends its whole episode below ``fall_height`` and a roll spends it past
+    ``fall_tilt_deg``; latching would freeze both at the moment they became
+    themselves. With the latch off, only a non-finite state stops an env, the
+    descriptor and the objective integrate over the full episode for every
+    candidate, and viability is decided by a predicate on *behaviour* rather
+    than on posture.
+
+    Property 3 of the old gate survives the change: every archived elite is
+    still scored over the same full 7 s, so the axes stay comparable."""
+
     @property
     def fall_tilt_cos(self) -> float:
         """``cos(fall_tilt_deg)`` — compared against ``-projected_gravity_b.z``."""
@@ -178,10 +193,12 @@ class RolloutMetrics:
             torch.isfinite(base_pos).all(dim=-1)
             & torch.isfinite(projected_gravity_b).all(dim=-1)
         )
-        upright = -projected_gravity_b[:, 2]  # 1 upright, 0 on its side, -1 upside down
-        too_low = base_pos[:, 2] < cfg.fall_height
-        too_tilted = upright < cfg.fall_tilt_cos
-        fall_now = (~finite) | too_low | too_tilted
+        fall_now = ~finite
+        if cfg.latch_fall:
+            upright = -projected_gravity_b[:, 2]  # 1 upright, 0 on its side, -1 inverted
+            too_low = base_pos[:, 2] < cfg.fall_height
+            too_tilted = upright < cfg.fall_tilt_cos
+            fall_now = fall_now | too_low | too_tilted
 
         alive_before = ~self.fallen
         self.fallen |= alive_before & fall_now

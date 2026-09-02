@@ -397,3 +397,26 @@ class DescriptorCfg:
 
 
 DUTY_FACTOR_DESCRIPTOR = DescriptorCfg()
+
+
+def grid_indices(
+    measures: np.ndarray, dims: tuple[int, int], ranges
+) -> np.ndarray:
+    """``(N, 2)`` per-axis bin indices, matching ``ribs.archives.GridArchive``.
+
+    Reimplemented rather than asked of pyribs so a *re-measured* descriptor can
+    be compared against an archived cell without rebuilding the archive — which
+    is how :mod:`qd.verify_archive` asks whether an elite is still in the cell
+    it was filed under.
+    """
+    cols = []
+    for k, (lo, hi) in enumerate(ranges):
+        idx = np.floor((np.asarray(measures)[:, k] - lo) / (hi - lo) * dims[k])
+        cols.append(np.clip(idx, 0, dims[k] - 1).astype(int))
+    return np.stack(cols, axis=-1)
+
+
+def cell_index(measures: np.ndarray, dims: tuple[int, int], ranges) -> np.ndarray:
+    """Flat cell index, the integer a checkpoint's ``index`` column holds."""
+    grid = grid_indices(measures, dims, ranges)
+    return np.ravel_multi_index((grid[:, 0], grid[:, 1]), tuple(dims))

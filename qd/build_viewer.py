@@ -119,6 +119,9 @@ def _load(manifest_path: Path, label: str, budget_bytes: float, top: int) -> dic
         "label": label,
         "genome": manifest["genome"],
         "grid": dims,
+        # Absent on a v1/v2 manifest; the page falls back to duty factor, which
+        # is what those archives were binned on.
+        "descriptor": manifest.get("descriptor"),
         "fps": manifest["fps"],
         "episodeSeconds": manifest["episode_seconds"],
         "elites": out_entries,
@@ -300,9 +303,11 @@ footer p { margin: 0 0 8px; }
   <header>
     <span class="eyebrow">Quality-Diversity · MuJoCo Warp · Microduck</span>
     <h1>Microduck Gait Archive</h1>
-    <p class="lede">Every cell is a different <em>way of walking</em>, indexed by how much of the
-    episode each foot spent on the ground. MAP-Elites keeps the best gait found for each
-    combination — so this is a map of behaviours, not a single best policy. Pick a cell to watch it.</p>
+    <p class="lede">Every cell is a different <em>way of walking</em>. MAP-Elites keeps the best gait
+    found for each combination of the two behaviour axes named under the grid — so this is a map of
+    behaviours, not a single best policy. The axes differ between archives: v1 and v2 are indexed by
+    how much of the episode each foot spent on the ground, v3 by axes chosen because that one barely
+    moved. Pick a cell to watch it.</p>
   </header>
 
   <div class="switch" id="switch" role="group" aria-label="Archive"></div>
@@ -315,10 +320,10 @@ footer p { margin: 0 0 8px; }
       <p class="hint">Colour is fitness: forward metres, minus a penalty for time spent fallen.
         Click a cell, or focus the grid and use the arrow keys.</p>
       <div class="grid-frame">
-        <div class="ylab">Right foot duty factor →</div>
+        <div class="ylab" id="ylab">Right foot duty factor →</div>
         <div class="grid" id="grid" role="grid" aria-label="Archive cells"></div>
         <div></div>
-        <div class="xlab">Left foot duty factor →</div>
+        <div class="xlab" id="xlab">Left foot duty factor →</div>
       </div>
       <div class="scale">
         <span id="scaleMin">—</span>
@@ -379,6 +384,24 @@ function renderStats(a) {
     .map(([k, v]) => `<div class="stat"><dt>${k}</dt><dd>${v}</dd></div>`).join("");
 }
 
+// A v1/v2 manifest predates per-archive axes and was binned on duty factor.
+function descOf(a) {
+  return a.descriptor || {
+    axes: ["duty_left", "duty_right"],
+    labels: ["left-foot duty factor", "right-foot duty factor"],
+  };
+}
+function mx(e) { return e.measure_x !== undefined ? e.measure_x : e.duty_left; }
+function my(e) { return e.measure_y !== undefined ? e.measure_y : e.duty_right; }
+function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+function fmt(v) { return Math.abs(v) >= 0.1 ? v.toFixed(2) : v.toPrecision(3); }
+
+function renderAxes(a) {
+  const d = descOf(a);
+  document.getElementById("xlab").textContent = cap(d.labels[0]) + " →";
+  document.getElementById("ylab").textContent = cap(d.labels[1]) + " →";
+}
+
 function renderGrid(a) {
   const [rows, cols] = a.grid;
   const objs = a.elites.map(e => e.archived_fitness);
@@ -404,7 +427,7 @@ function renderGrid(a) {
       b.setAttribute("aria-pressed", "false");
       if (e) {
         b.style.background = colorFor(e.archived_fitness, lo, hi);
-        b.title = `cell (${r}, ${c}) · duty ${e.duty_left.toFixed(2)} / ${e.duty_right.toFixed(2)} · ${f3(e.archived_fitness)} m`;
+        b.title = `cell (${r}, ${c}) · ${fmt(mx(e))} / ${fmt(my(e))} · ${f3(e.archived_fitness)} m`;
         b.setAttribute("aria-label", b.title);
         b.onclick = () => select(e);
       } else {
@@ -441,7 +464,9 @@ function select(e) {
   if (idx) { idx.setAttribute("aria-pressed", "true"); }
 
   document.getElementById("selTitle").textContent = `Cell (${e.cell[0]}, ${e.cell[1]})`;
+  const d = descOf(DATA[current]);
   document.getElementById("selHint").textContent =
+    `${cap(d.labels[0])} ${fmt(mx(e))}, ${d.labels[1]} ${fmt(my(e))}. ` +
     `Left foot down ${(e.duty_left * 100).toFixed(0)}% of the time, right foot ${(e.duty_right * 100).toFixed(0)}%.`;
 
   const player = document.getElementById("player");
@@ -456,6 +481,8 @@ function select(e) {
     <div><dt>Replay fitness</dt><dd>${f3(e.replay_fitness)} m</dd></div>
     <div><dt>Distance travelled</dt><dd>${f3(e.displacement_m)} m</dd></div>
     <div><dt>Time upright</dt><dd>${e.upright_s.toFixed(2)} s</dd></div>
+    <div><dt>${cap(d.labels[0])}</dt><dd>${fmt(mx(e))}</dd></div>
+    <div><dt>${cap(d.labels[1])}</dt><dd>${fmt(my(e))}</dd></div>
     <div><dt>Duty L / R</dt><dd>${e.duty_left.toFixed(2)} / ${e.duty_right.toFixed(2)}</dd></div>
     <div><dt>Outcome</dt><dd><span class="verdict" data-ok="${ok}">${e.survived ? "Stayed up" : "Fell"}</span></dd></div>`;
 }
@@ -465,7 +492,7 @@ function show(i) {
   const a = DATA[i];
   document.querySelectorAll("#switch button").forEach((b, j) =>
     b.setAttribute("aria-pressed", String(j === i)));
-  renderStats(a); renderGrid(a); renderTop(a);
+  renderAxes(a); renderStats(a); renderGrid(a); renderTop(a);
   const best = [...a.elites].sort((x, y) => y.archived_fitness - x.archived_fitness)[0];
   select(best);
   document.getElementById("footnotes").innerHTML = `

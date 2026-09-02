@@ -1,11 +1,19 @@
-"""PGA-MAP-Elites over a closed-loop MLP genome — walking-v2.
+"""PGA-MAP-Elites over a closed-loop MLP genome — walking-v2 and v3.
 
-Same 20x20 duty-factor archive, same objective (+x displacement), same
-behaviour descriptor as Phase 2, so the ``summary.json`` files stay comparable.
-Three things changed for v2, and they are the whole job::
+Same objective throughout (+x displacement over a 7 s episode), same 20x20
+grid, so the ``summary.json`` files stay comparable across all three runs.
+What changes is the admission rule and, in v3, the axes::
 
+    # v2
     uv run python -m qd.pga.run_pga_me --iterations 200 --batch-size 1024 \
         --seed-genome logs/qd/seeds/ppo_seed.npz
+
+    # v3
+    uv run python -m qd.pga.run_pga_me --iterations 50 --batch-size 1024 \
+        --seed-genome logs/qd/seeds/ppo_seeds.npz --seeding.jitter-count 240 \
+        --insertion-replicas 8 \
+        --descriptor.axis-x torso_height_mean --descriptor.x-range 0.11667 0.12184 \
+        --descriptor.axis-y joint_speed --descriptor.y-range 0.89228 2.50831
 
 1. **Honest physics.** Every shell collides with the ground and the rollout
    stops at the fall, so no post-fall frame reaches fitness, descriptor,
@@ -37,6 +45,26 @@ Each iteration:
    zero means the critic or the reward wiring is broken rather than that PG
    variation "did not help"; a feasibility rate collapsing to zero means the
    gate has closed on the search and the run needs the episode-length ramp.
+
+Walking-v3 changes two things on top, and they are one idea:
+
+4. **The gate matches the bar.** ``--insertion-replicas 8`` with unanimous
+   survival and median fitness — the same evidence the 8-replica verification
+   demands. v2's 2-replica gate produced an archive that was 100% survivors by
+   construction and 8% by verification; a candidate that survives 2 of 2 still
+   has a 95% interval on its true survival rate reaching down to ~0.22.
+
+5. **The descriptor is one this robot can move in.** ``--descriptor.*`` selects
+   the two axes and their ranges. Per-foot duty factor put all six teacher
+   gaits in one cell of the 20x20 grid and no weight-space mutation moved them
+   out; :mod:`qd.select_descriptor` measures every candidate axis for
+   between-gait spread, replica noise and mutation reach, and v3 runs on what
+   that measurement chose.
+
+The two are related: v3's axes are fine-grained enough that a *single*
+rollout's descriptor jitters about a bin, and it is the median over the eight
+insertion replicas that makes a cell mean something. The gate stabilises the
+geography, not only the fitness.
 """
 
 from __future__ import annotations
@@ -59,6 +87,7 @@ from qd.common import (
     survival_summary,
     write_json,
 )
+from qd.descriptors import DescriptorCfg
 from qd.pga.evaluate import (
     PolicyHarnessCfg,
     PolicyRolloutHarness,
@@ -107,6 +136,18 @@ class Args:
     line_sigma: float = LINE_SIGMA
 
     grid_dims: tuple[int, int] = DEFAULT_GRID_DIMS
+
+    descriptor: DescriptorCfg = field(default_factory=DescriptorCfg)
+    """The two behaviour axes the archive is binned on, and their ranges.
+
+    Defaults to walking-v2's per-foot duty factor, which walking-v3 measured as
+    unusable: six teacher gaits spanning a 6x speed range land in one cell of
+    the 20x20 grid, and no weight-space mutation moves them out of it. v3's
+    chosen pair and the measurement behind it are in
+    :mod:`qd.select_descriptor`; the launch command in the README passes them
+    explicitly rather than changing this default, so a v2 command line still
+    reproduces v2."""
+
     seed: int = 0
     device: str = "cuda:0"
 
@@ -143,6 +184,16 @@ class Args:
     td3: Td3Cfg = field(default_factory=Td3Cfg)
 
     checkpoint_every: int = 25
+
+    budget_checkpoint_evals: int | None = None
+    """Also checkpoint the archive the moment the run passes this many
+    evaluations, as ``archive_budget.npz``.
+
+    An 8-replica run spends 8x per candidate, so at equal wall clock it tries
+    an eighth as many genomes. Comparing its final archive against j003's is
+    then a comparison at unequal cost. This is the budget-matched snapshot —
+    pass j003's 207,049 to get an archive that cost exactly what j003's did."""
+
     qd_score_offset: float | None = None
 
 
@@ -240,8 +291,15 @@ def main(args: Args | None = None) -> None:
     archive = make_archive(
         solution_dim=spec.genome_dim,
         grid_dims=args.grid_dims,
+        measure_ranges=args.descriptor.ranges,
         qd_score_offset=offset,
         seed=args.seed,
+    )
+    print(
+        f"descriptor: {args.descriptor.axis_x} {tuple(args.descriptor.x_range)} x "
+        f"{args.descriptor.axis_y} {tuple(args.descriptor.y_range)} "
+        f"on a {args.grid_dims[0]}x{args.grid_dims[1]} grid",
+        flush=True,
     )
 
     # +1 world for the greedy actor, evaluated alongside the offspring.
@@ -255,6 +313,7 @@ def main(args: Args | None = None) -> None:
         args.fitness,
         spec,
         args.reward,
+        args.descriptor,
     )
     trainer = Td3Trainer(args.td3, args.device, seed=args.seed, spec=spec)
 
@@ -376,6 +435,7 @@ def main(args: Args | None = None) -> None:
         )
 
     # --- PGA-ME loop -------------------------------------------------------- #
+    budget_snapshot_taken = False
     num_ga = round(args.proportion_mutation_ga * args.batch_size)
     num_pg = args.batch_size - num_ga
     print(f"offspring split: {num_ga} GA + {num_pg} PG + 1 greedy actor", flush=True)
@@ -439,11 +499,40 @@ def main(args: Args | None = None) -> None:
 
         if args.checkpoint_every and it % args.checkpoint_every == 0:
             save_archive(archive, out / f"archive_it{it:04d}.npz", _meta(args, it, evals))
-            plot_archive(archive, out / f"heatmap_it{it:04d}.png", f"PGA-ME (it {it})")
+            plot_archive(
+                archive,
+                out / f"heatmap_it{it:04d}.png",
+                f"PGA-ME (it {it})",
+                descriptor=args.descriptor,
+            )
             write_json(out / "history.json", history)
 
+        if (
+            args.budget_checkpoint_evals
+            and evals >= args.budget_checkpoint_evals
+            and not budget_snapshot_taken
+        ):
+            budget_snapshot_taken = True
+            save_archive(archive, out / "archive_budget.npz", _meta(args, it, evals))
+            plot_archive(
+                archive,
+                out / "heatmap_budget.png",
+                f"PGA-ME at {evals} evaluations (budget-matched)",
+                descriptor=args.descriptor,
+            )
+            print(
+                f"  budget-matched snapshot at {evals} evaluations "
+                f"(iteration {it}) -> archive_budget.npz",
+                flush=True,
+            )
+
     save_archive(archive, out / "archive_final.npz", _meta(args, args.iterations, evals))
-    plot_archive(archive, out / "heatmap_final.png", "PGA-MAP-Elites (final)")
+    plot_archive(
+        archive,
+        out / "heatmap_final.png",
+        "PGA-MAP-Elites (final)",
+        descriptor=args.descriptor,
+    )
     write_json(out / "history.json", history)
 
     mean = lambda key: (
@@ -460,6 +549,8 @@ def main(args: Args | None = None) -> None:
             "wall_clock_s": time.perf_counter() - t_start,
             "survival_gate": gate,
             "insertion_replicas": reps,
+            "descriptor_axes": list(args.descriptor.names),
+            "descriptor_ranges": [list(r) for r in args.descriptor.ranges],
             "full_collision": args.full_collision,
             "seed_genome": str(args.seed_genome) if args.seed_genome else None,
             "mean_ga_insert_rate": mean("ga_insert_rate"),
@@ -504,6 +595,9 @@ def _meta(args: Args, it: int, evals: int) -> dict:
         "insertion_replicas": args.insertion_replicas,
         "full_collision": args.full_collision,
         "seeded": args.seed_genome is not None,
+        # Read back by verify_archive / render_gaits / the viewer, so a v3
+        # archive is never re-measured on the axes it was not built on.
+        **args.descriptor.to_meta(),
     }
 
 

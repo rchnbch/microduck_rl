@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 import tyro
 
+from qd.descriptors import DescriptorCfg
 from qd.common import FitnessCfg, load_archive, write_json
 from qd.replay import infer_kind, reevaluate
 
@@ -91,7 +92,14 @@ def main(args: Args | None = None) -> None:
     # so a reshape recovers the per-elite axis whatever the chunking did.
     tiled = np.repeat(batch, reps, axis=0)
     fitness, measures, info, control_dt = reevaluate(
-        tiled, kind, args.fitness, args.device, max_envs=min(512, len(tiled))
+        tiled,
+        kind,
+        args.fitness,
+        args.device,
+        max_envs=min(512, len(tiled)),
+        # The axes this archive was built on; a v1/v2 checkpoint says nothing
+        # and comes back as duty factor, which is what it used.
+        descriptor=DescriptorCfg.from_meta(data.get("meta")),
     )
     if reps > 1:
         fitness = np.median(fitness.reshape(len(batch), reps), axis=1)

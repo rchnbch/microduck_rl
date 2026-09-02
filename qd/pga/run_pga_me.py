@@ -227,6 +227,7 @@ def main(args: Args | None = None) -> None:
     # will not be inserted, but they are precisely the falling-over experience
     # the critic needs in its buffer to learn what NOT to do.
     seed_info: dict = {}
+    info: dict | None = None
     if args.seed_genome is not None:
         with np.load(args.seed_genome) as f:
             seeds = torch.as_tensor(
@@ -286,6 +287,11 @@ def main(args: Args | None = None) -> None:
         evals += min(remaining, num_envs)
         remaining -= num_envs
 
+    if info is None:
+        raise SystemExit(
+            "iteration 0 evaluated nothing: pass --seed-genome, or "
+            "--initial-solutions > 0, or both."
+        )
     surv = surv or survival_summary(info, harness.control_dt)
     surv["feasible_fraction"] = feasible
     stats = archive_stats(archive)

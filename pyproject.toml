@@ -37,6 +37,15 @@ dependencies = [
     "torch==2.9.1",
 ]
 
+[dependency-groups]
+# Quality-Diversity (MAP-Elites) gait search under qd/ — pyribs plus the
+# matplotlib/shapely extras its archive heatmaps need. Deliberately a GROUP and
+# not a [project] dependency: `uv sync` (the training path, and what HF Jobs
+# runs) must keep resolving exactly the packages it does today, and ribs drags
+# in numba / scikit-learn / pandas / shapely that training never imports.
+#   uv sync --group qd
+qd = ["ribs[visualize]>=0.12.0"]
+
 [project.entry-points."mjlab.tasks"]
 mjlab_microduck = "mjlab_microduck.tasks"
 

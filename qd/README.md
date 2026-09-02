@@ -1316,7 +1316,7 @@ If the batch index is part of the state, replicate across indices.
 > resolvable number**: a cell count on a grid finer than the measurement is a
 > count of quantization, not of behaviours.
 
-| | v2 single-sample | v2 re-evaluated (N=2) | v3 in-place ablation (it 10) | v3 permuted (it 10) | v3 budget-matched (207k evals) | **v3 full (426k evals)** |
+| | v2 single-sample | v2 re-evaluated (N=2) | v3 in-place ablation (it 10) | v3 permuted (it 10) | v3 budget-matched (213k evals) | **v3 full (426k evals)** |
 | --- | --- | --- | --- | --- | --- | --- |
 | **VERIFIED — 8 fresh rollouts per elite** | | | | | | |
 | elites surviving 7-of-8 | 4 | 5 | 193 | 223 | 242 | **268** |
@@ -1337,7 +1337,10 @@ holds **268 robust elites in 109 resolvable cells**, and its best verified
 walker covers **+2.286 m** against +2.117 m. The elites that never survive a
 single replay, 17 in v2's single-sample archive and 5 after its N=2 fix, are
 **zero**. At *equal* evaluation budget (the 207k snapshot) the numbers are
-242 elites in 110 cells: the win is not bought with the extra budget.
+242 elites in 110 cells: the win is not bought with the extra budget. (That
+snapshot fires on the first iteration *past* j003's 207,049 evaluations, so it
+is 213,192 — 3% more, in v3's favour by 3%, which is smaller than the few-elite
+uncertainty the verification itself carries.)
 
 Both halves contributed and they are separable. The descriptor is why there are
 cells to fill at all — v2's search was not failing to find gaits, it was
@@ -1394,14 +1397,15 @@ survival `p`, the chance of clearing a 7-of-8 bar is `8p⁷(1−p) + p⁸`:
 
 | true survival `p` | P(passes 7 of 8) |
 | --- | --- |
-| 0.80 | 0.50 |
-| 0.85 | 0.66 |
-| 0.88 | **0.73** |
-| 0.90 | 0.81 |
-| 0.95 | 0.94 |
+| 0.80 | 0.503 |
+| 0.85 | 0.657 |
+| 0.883 | **0.762** |
+| 0.90 | 0.813 |
+| 0.95 | 0.943 |
 
-At the archive's measured mean of 0.883 the expected pass rate is ~0.72, and
-75% is what was observed. **A 90% pass rate at a 7-of-8 bar requires nearly
+At the archive's measured mean of 0.883 the expected pass rate is **0.762**,
+against **0.753** observed — the archive is behaving exactly like a population
+whose typical member is 88% robust, with no residual to explain. **A 90% pass rate at a 7-of-8 bar requires nearly
 every elite to be genuinely 95%-robust**, which is a much stronger demand than
 "the gate matches the bar" — the criterion and the gate are not the same
 threshold, and I did not notice that when the criterion was set.
@@ -1460,7 +1464,8 @@ uv run python -m qd.pga.run_pga_me --iterations 10 --batch-size 1024 \
 ```
 
 `--budget-checkpoint-evals 207049` snapshots the archive the moment the run
-passes j003's evaluation count, so the v2-vs-v3 comparison can be read both at
+passes j003's evaluation count — the first iteration boundary past it, which
+here is iteration 24 at 213,192 evaluations — so the v2-vs-v3 comparison can be read both at
 equal cost and at full budget. Measured on an RTX 3060: iteration 0 (seed block
 plus random initialisation, 16 rollouts) 278 s, then **141 s per iteration** —
 **426,392 evaluations in 2.03 h**, 2.06x j003's evaluations for 1.4x its wall

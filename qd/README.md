@@ -993,8 +993,12 @@ footnote — it is the trade. Half as many genomes are tried, and each result is
 worth believing. Whether the archive that comes out is better is an empirical
 question, answered in the comparison below rather than assumed.
 
-**Its limitation, stated plainly.** Two replicas is a much weaker filter than
-the eight the verification uses. A policy that survives 2 of 2 has a survival
+**Its limitation, stated plainly** (and understated, as
+[v3 later measured](#the-replicas-were-not-independent-and-that-is-most-of-why-v2-failed):
+the two replicas were not two independent draws, because re-rolling the same
+batch puts every replica in the same world, and a world index carries a
+persistent bias worth ~6x the between-rollout spread). Two replicas is a much
+weaker filter than the eight the verification uses. A policy that survives 2 of 2 has a survival
 rate whose 95% interval still stretches down to about 0.22; only about 3 in 4
 genuinely-90%-robust policies pass it on any given attempt. So the re-evaluated
 run is *not* expected to produce an archive that is 100% verified — it is
@@ -1257,6 +1261,44 @@ deviation — so a *single* rollout's descriptor jitters about two bins, and the
 median over the eight insertion replicas is what makes a cell mean anything.
 The gate stabilises the geography as well as the fitness, and this descriptor
 would have been a bad choice under v2's rule.
+
+#### The replicas were not independent, and that is most of why v2 failed
+
+Setting `--insertion-replicas 8` is not the same as having eight independent
+draws, and this took a measurement to notice. Insertion replicates by rolling
+the identical block out N times; `qd.verify_archive` replicates by putting a
+genome in N different **worlds** of one batch. Those are the same thing only if
+a world index carries no bias.
+
+It does. Same genome, same harness, deliberately measured both ways:
+
+| | displacement sd | descriptor sd (height, limb speed) |
+| --- | --- | --- |
+| 32 different **worlds**, one rollout | **0.469 m** | — |
+| same **slot**, 6 sequential rollouts | **0.071 m** | 0.00012 m, 0.0115 rad/s |
+| **permuted slots**, 6 replicas | **0.226 m** | 0.00020 m, 0.0401 rad/s |
+
+A world's position in the batched contact solve is a persistent property of the
+world, not a fresh coin flip per rollout. So v2's replication mechanism — which
+v3 inherited — sampled roughly a *sixth* of the variance the verification bar
+measures, and the gate built to match the bar was mechanically a fraction of
+it.
+
+**This is part of the answer to why v2's re-evaluated run still verified at 8%.**
+Its two replicas were not two draws of a chaotic quantity; they were one draw
+plus a small perturbation of it. The N=2 rule was weaker than even its own
+stated limitation ("a policy that survives 2 of 2 has a 95% interval reaching
+down to ~0.22") assumed, because that interval assumes independence.
+
+The fix costs nothing: shuffle which world each candidate occupies on each
+replica and un-permute the results — same worlds, same replica count, same wall
+clock. `--insertion-permute-worlds` is **on by default** from v3 onward;
+`--no-insertion-permute-worlds` reproduces v2's behaviour exactly, which is what
+the ablation below uses.
+
+The generalisable version, for anyone replicating a stochastic evaluation on a
+batched simulator: **re-running the same batch is not the same as resampling.**
+If the batch index is part of the state, replicate across indices.
 
 ### Reproduction
 

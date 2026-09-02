@@ -325,3 +325,53 @@ def test_seed_family_splits_across_the_sigma_ladder_too():
     wide = [c.std().item() for c in (clouds[1], clouds[3])]
     assert max(narrow) < min(wide), "the ladder collapsed to one radius"
     assert min(wide) > 5 * max(narrow)
+
+
+# --------------------------------------------------------------------------- #
+# Re-evaluation on insertion
+# --------------------------------------------------------------------------- #
+
+
+def _run(displacement, fell, fitness=None):
+    n = len(displacement)
+    return (
+        np.asarray(displacement if fitness is None else fitness, dtype=float),
+        np.full((n, 2), 0.5),
+        {
+            "displacement": np.asarray(displacement, dtype=float),
+            "fell": np.asarray(fell, dtype=bool),
+            "alive_steps": np.where(np.asarray(fell, dtype=bool), 100, 350),
+            "survival_fraction": np.where(np.asarray(fell, dtype=bool), 0.3, 1.0),
+        },
+    )
+
+
+def test_survival_across_replicas_is_unanimous():
+    """A policy that falls one time in N is a policy that falls. Admitting it
+    is exactly how the single-sample run filled its archive with coin-flips."""
+    from qd.pga.run_pga_me import combine_replicas
+
+    a = _run([1.0, 2.0, 3.0], [False, False, True])
+    b = _run([1.2, 0.5, 0.1], [False, True, True])
+    _, _, info = combine_replicas([a, b])
+    assert info["fell"].tolist() == [False, True, True]
+
+
+def test_replica_fitness_is_the_median_not_the_max():
+    """The max is the luck-ranking being removed."""
+    from qd.pga.run_pga_me import combine_replicas
+
+    runs = [_run([0.2], [False]), _run([2.0], [False]), _run([0.4], [False])]
+    fitness, _, info = combine_replicas(runs)
+    assert fitness[0] == pytest.approx(0.4)
+    assert info["displacement"][0] == pytest.approx(0.4)
+    assert info["displacement"][0] < 2.0, "a single lucky rollout must not win"
+
+
+def test_single_replica_is_passed_through_untouched():
+    """N=1 must reproduce the baseline rule exactly, or the two runs are not
+    comparable."""
+    from qd.pga.run_pga_me import combine_replicas
+
+    only = _run([1.0, 2.0], [False, True])
+    assert combine_replicas([only]) is only

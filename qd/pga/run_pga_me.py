@@ -118,6 +118,26 @@ class Args:
 
     ``False`` reproduces v1's penalty-only archive."""
 
+    insertion_replicas: int = 1
+    """Rollouts per candidate before it is offered to the archive.
+
+    1 is v1's rule and the walking-v2 baseline. It is also, on this simulator,
+    wrong: a walking policy's displacement has a standard deviation of 0.605 m
+    across byte-identical worlds (`qd.check_repeatability`), so a single sample
+    admits any marginal policy that happened to stay upright once and then ranks
+    cells by which occupant got the luckiest distance. Measured on the 200-
+    iteration single-sample run: of 81 elites, **7** survived 7-of-8 replicas,
+    and **all six distilled seeds — the only genomes with 99-100% measured
+    replica survival — had been evicted** by luckier descendants.
+
+    With N > 1 a candidate is rolled out N times and judged on all of them: it
+    counts as a survivor only if it survived *every* replica, and its fitness is
+    the median displacement. Every replica's transitions still go to the buffer,
+    so the critic sees N times the data.
+
+    This costs exactly N x the evaluations, so a budget-matched run divides its
+    iterations by N — half the genomes tried, each worth believing."""
+
     fitness: FitnessCfg = field(default_factory=FitnessCfg)
     reward: ShapedRewardCfg = field(default_factory=ShapedRewardCfg)
     td3: Td3Cfg = field(default_factory=Td3Cfg)
@@ -175,6 +195,36 @@ def _insert(
     return float(np.sum(np.asarray(status) > 0) / attempted), feasible_rate
 
 
+def combine_replicas(runs: list[tuple]) -> tuple:
+    """Fold ``[(fitness, measures, info), ...]`` from N rollouts into one verdict.
+
+    Two deliberate asymmetries, both because the failure mode being fixed is
+    *luck*:
+
+    * **survival is unanimous** — a candidate counts as a survivor only if it
+      stayed upright in every replica. A policy that falls one time in N is a
+      policy that falls, and admitting it is exactly how the single-sample run
+      filled its archive with coin-flips.
+    * **fitness is the median** — not the max (which is the luck-ranking being
+      removed) and not the mean (which one catastrophic replica drags around).
+    """
+    if len(runs) == 1:
+        return runs[0]
+    stack = lambda key: np.stack([r[2][key] for r in runs])
+    upright = np.stack([~r[2]["fell"] for r in runs])
+    info = {
+        "displacement": np.median(stack("displacement"), axis=0),
+        "fell": ~upright.all(axis=0),
+        "alive_steps": np.median(stack("alive_steps"), axis=0),
+        "survival_fraction": np.mean(stack("survival_fraction"), axis=0),
+    }
+    return (
+        np.median(np.stack([r[0] for r in runs]), axis=0),
+        np.median(np.stack([r[1] for r in runs]), axis=0),
+        info,
+    )
+
+
 def main(args: Args | None = None) -> None:
     args = args or tyro.cli(Args)
     out = Path(args.out_dir)
@@ -213,10 +263,26 @@ def main(args: Args | None = None) -> None:
     evals = 0
     gate = args.survival_gate
 
+    reps = max(1, args.insertion_replicas)
+
+    def evaluate(block: torch.Tensor):
+        """Roll a block out ``reps`` times; return the combined verdict.
+
+        A candidate survives only if it survived **every** replica, and its
+        fitness is the median displacement — so a cell is won by being reliably
+        good rather than by one good day. Every replica's transitions are
+        banked; the critic has no reason to see less data than was generated.
+        """
+        runs = []
+        for _ in range(reps):
+            fitness, measures, info, transitions = harness.rollout(block)
+            trainer.buffer.add(transitions)
+            runs.append((fitness, measures, info))
+        return combine_replicas(runs)
+
     def evaluate_and_insert(block: torch.Tensor) -> tuple[dict, float, float]:
         """Roll a block out, bank its transitions, offer the survivors."""
-        fitness, measures, info, transitions = harness.rollout(block)
-        trainer.buffer.add(transitions)
+        fitness, measures, info = evaluate(block)
         rate, feasible = _insert(
             archive, block, fitness, measures, ~info["fell"], gate=gate
         )
@@ -255,7 +321,7 @@ def main(args: Args | None = None) -> None:
             ]
         )[:num_envs]
         info, _, _ = evaluate_and_insert(block)
-        evals += num_envs
+        evals += num_envs * reps
         n_seeds = len(seeds)
         seed_info = {
             "seeds": n_seeds,
@@ -284,7 +350,7 @@ def main(args: Args | None = None) -> None:
         block = spec.initial_population(num_envs, generator, args.device)
         info, _, feasible = evaluate_and_insert(block)
         surv = survival_summary(info, harness.control_dt)
-        evals += min(remaining, num_envs)
+        evals += min(remaining, num_envs) * reps
         remaining -= num_envs
 
     if info is None:
@@ -332,9 +398,8 @@ def main(args: Args | None = None) -> None:
         greedy = trainer.greedy_genome()
         population = torch.cat([ga, pg, greedy])
 
-        fitness, measures, info, transitions = harness.rollout(population)
-        trainer.buffer.add(transitions)
-        evals += population.shape[0]
+        fitness, measures, info = evaluate(population)
+        evals += population.shape[0] * reps
         survived = ~info["fell"]
 
         blocks = {
@@ -394,6 +459,7 @@ def main(args: Args | None = None) -> None:
             "evaluations": evals,
             "wall_clock_s": time.perf_counter() - t_start,
             "survival_gate": gate,
+            "insertion_replicas": reps,
             "full_collision": args.full_collision,
             "seed_genome": str(args.seed_genome) if args.seed_genome else None,
             "mean_ga_insert_rate": mean("ga_insert_rate"),
@@ -435,6 +501,7 @@ def _meta(args: Args, it: int, evals: int) -> dict:
         # Read by qd.compare_archives / qd.survival_report so a v1 archive and
         # a v2 archive are never silently reported as the same kind of thing.
         "survival_gate": args.survival_gate,
+        "insertion_replicas": args.insertion_replicas,
         "full_collision": args.full_collision,
         "seeded": args.seed_genome is not None,
     }

@@ -23,6 +23,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from qd.descriptors import DEFAULT_CONTROL_DT, DescriptorCfg, GaitStats
+
 # --------------------------------------------------------------------------- #
 # Objective and behaviour descriptor
 # --------------------------------------------------------------------------- #
@@ -106,10 +108,21 @@ class RolloutMetrics:
         cfg: FitnessCfg,
         device: str | torch.device,
         episode_steps: int | None = None,
+        descriptor: DescriptorCfg | None = None,
+        control_dt: float = DEFAULT_CONTROL_DT,
     ):
         self.cfg = cfg
         self.num_envs = num_envs
         self.device = device
+        self.descriptor = descriptor or DescriptorCfg()
+        """Which two of :data:`qd.descriptors.AXES` this archive is binned on.
+
+        Defaults to walking-v2's per-foot duty factor, so every caller that
+        does not ask for v3's axes keeps measuring exactly what it used to."""
+        self.stats = GaitStats(num_envs, device, control_dt)
+        """Accumulates *every* candidate axis, not only the two in use — the
+        extra ones cost a handful of running sums and are what
+        :mod:`qd.select_descriptor` measures the descriptor table from."""
         self.episode_steps = episode_steps
         """Denominator for the fallen fraction, when the loop may stop early.
 
@@ -123,8 +136,12 @@ class RolloutMetrics:
         self.frozen_x = z(torch.float32)
         self.fallen = z(torch.bool)
         self.alive_steps = z(torch.long)
-        self.contact_steps = torch.zeros(num_envs, 2, dtype=torch.long, device=device)
         self.total_steps = 0
+
+    @property
+    def contact_steps(self) -> torch.Tensor:
+        """Per-foot contact-step counts; owned by the gait-stats accumulator."""
+        return self.stats.contact_steps
 
     def begin(self, base_pos: torch.Tensor) -> None:
         """Latch the start position; call once, after the settle phase."""
@@ -133,7 +150,7 @@ class RolloutMetrics:
         self.frozen_x.copy_(self.start_x)
         self.fallen.zero_()
         self.alive_steps.zero_()
-        self.contact_steps.zero_()
+        self.stats.begin(base_pos)
         self.total_steps = 0
 
     def update(
@@ -141,6 +158,7 @@ class RolloutMetrics:
         base_pos: torch.Tensor,
         projected_gravity_b: torch.Tensor,
         foot_contact: torch.Tensor,
+        extras: dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Fold one control step in.
 
@@ -150,6 +168,10 @@ class RolloutMetrics:
                 Upright is ``(0, 0, -1)``.
             foot_contact: ``(N, 2)`` boolean/float left- and right-foot ground
                 contact for this step.
+            extras: optional per-step readouts named in
+                :data:`qd.descriptors.EXTRA_CHANNELS`, for the candidate axes
+                that need more than base state and foot contact. Axes whose
+                channel is absent come back NaN rather than zero.
         """
         cfg = self.cfg
         finite = (
@@ -168,7 +190,7 @@ class RolloutMetrics:
         # fails immediately has a non-zero duty-factor denominator.
         counted = alive_before
         self.alive_steps += counted.long()
-        self.contact_steps += (foot_contact.bool() & counted.unsqueeze(-1)).long()
+        self.stats.update(counted, base_pos, projected_gravity_b, foot_contact, extras)
         self.frozen_x = torch.where(
             counted, torch.nan_to_num(base_pos[:, 0].to(torch.float32)), self.frozen_x
         )
@@ -184,8 +206,8 @@ class RolloutMetrics:
         fitness = displacement - cfg.fall_penalty * fallen_fraction
         fitness = torch.nan_to_num(fitness, nan=cfg.min_fitness).clamp_min(cfg.min_fitness)
 
-        denom = self.alive_steps.clamp_min(1).unsqueeze(-1).float()
-        measures = (self.contact_steps.float() / denom).clamp(0.0, 1.0)
+        axes = self.stats.finalize(self.alive_steps)
+        measures = self.descriptor.measures(axes)
 
         info = {
             "displacement": displacement.cpu().numpy(),
@@ -193,7 +215,12 @@ class RolloutMetrics:
             "alive_steps": self.alive_steps.cpu().numpy(),
             "survival_fraction": (self.alive_steps.float() / total).cpu().numpy(),
         }
-        return fitness.cpu().numpy(), measures.cpu().numpy(), info
+        # Every candidate axis rides along, prefixed so it cannot collide with
+        # the keys above and so `qd.replay.reevaluate` concatenates it like any
+        # other per-env array. This is what makes the descriptor-selection
+        # table one rollout per genome instead of one per axis.
+        info.update({f"axis/{name}": value for name, value in axes.items()})
+        return fitness.cpu().numpy(), measures, info
 
 
 # --------------------------------------------------------------------------- #
@@ -201,8 +228,10 @@ class RolloutMetrics:
 # --------------------------------------------------------------------------- #
 
 DEFAULT_GRID_DIMS: tuple[int, int] = (20, 20)
-DEFAULT_MEASURE_RANGES: list[tuple[float, float]] = [(0.0, 1.0), (0.0, 1.0)]
-MEASURE_NAMES: tuple[str, str] = ("left_foot_duty_factor", "right_foot_duty_factor")
+DEFAULT_MEASURE_RANGES: list[tuple[float, float]] = DescriptorCfg().ranges
+MEASURE_NAMES: tuple[str, str] = DescriptorCfg().names
+"""v1/v2's axis names. v3 archives carry theirs in the checkpoint's ``meta``;
+read them back with :meth:`qd.descriptors.DescriptorCfg.from_meta`."""
 
 
 def make_archive(
@@ -280,8 +309,9 @@ def plot_archive(
     title: str = "MAP-Elites archive",
     vmin: float | None = None,
     vmax: float | None = None,
+    descriptor: DescriptorCfg | None = None,
 ) -> Path:
-    """Save a duty-factor heatmap of the archive."""
+    """Save a heatmap of the archive over its two descriptor axes."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -292,8 +322,9 @@ def plot_archive(
     path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(6.0, 5.0), dpi=140)
     grid_archive_heatmap(archive, ax=ax, vmin=vmin, vmax=vmax, cmap="viridis")
-    ax.set_xlabel(MEASURE_NAMES[0].replace("_", " "))
-    ax.set_ylabel(MEASURE_NAMES[1].replace("_", " "))
+    labels = (descriptor or DescriptorCfg()).labels
+    ax.set_xlabel(labels[0])
+    ax.set_ylabel(labels[1])
     stats = archive_stats(archive)
     ax.set_title(
         f"{title}\ncoverage {stats['coverage'] * 100:.1f}%  "

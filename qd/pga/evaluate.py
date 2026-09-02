@@ -32,6 +32,7 @@ import numpy as np
 import torch
 
 from qd.common import FitnessCfg, RolloutMetrics
+from qd.descriptors import DescriptorCfg
 from qd.evaluate import FEET_CONTACT_SENSOR, _deterministic_robot_cfg
 from qd.evaluate import HarnessCfg as _ActuatorCfg
 from qd.pga.policy_genome import DEFAULT_SPEC, PolicySpec
@@ -76,6 +77,16 @@ class PolicyHarnessCfg:
     everything is down there is nothing left worth simulating. The check needs
     a host sync, so it is not run every step — the comment on the transition
     buffer below explains what per-step syncing costs here."""
+
+    full_gait_stats: bool = False
+    """Read velocity / joint / actuator channels every step, whether or not the
+    archive's descriptor needs them.
+
+    Off during a run — the harness supplies exactly the channels the chosen
+    descriptor asks for, and nothing else. On for
+    :mod:`qd.select_descriptor`, which measures *every* candidate axis from one
+    rollout per genome and therefore needs the lot. These are device-side reads
+    with no host sync, so the cost is a few extra kernels per step."""
 
 
 @dataclass(frozen=True)
@@ -218,12 +229,17 @@ class PolicyRolloutHarness:
         fitness: FitnessCfg | None = None,
         spec: PolicySpec = DEFAULT_SPEC,
         reward: ShapedRewardCfg | None = None,
+        descriptor: DescriptorCfg | None = None,
     ):
         from mjlab.envs import ManagerBasedRlEnv
 
         self.cfg = cfg
         self.fitness = fitness or FitnessCfg()
         self.reward_cfg = reward or ShapedRewardCfg()
+        self.descriptor = descriptor or DescriptorCfg()
+        self._collect_extras = bool(
+            cfg.full_gait_stats or self.descriptor.needs
+        )
         self.spec = spec
         env_cfg = _stripped_velocity_env_cfg(
             cfg.num_envs, cfg.spawn_height, cfg.full_collision
@@ -268,6 +284,22 @@ class PolicyRolloutHarness:
         found = self.env.scene.sensors[FEET_CONTACT_SENSOR].data.found
         assert found is not None
         return found.reshape(self.num_envs, -1)[:, :2] > 0
+
+    def gait_extras(self) -> dict[str, torch.Tensor] | None:
+        """The extra per-step channels the candidate descriptor axes read.
+
+        ``None`` when the archive's descriptor needs none of them, which keeps
+        a duty-factor run byte-for-byte the work walking-v2 did. Every field is
+        a device-side view; nothing here syncs to the host."""
+        if not self._collect_extras:
+            return None
+        d = self.robot.data
+        return {
+            "lin_vel_w": d.root_link_lin_vel_w,
+            "ang_vel_b": d.root_link_ang_vel_b,
+            "joint_vel": d.joint_vel,
+            "qfrc_actuator": d.qfrc_actuator,
+        }
 
     # -- rollout ------------------------------------------------------------- #
 
@@ -328,7 +360,14 @@ class PolicyRolloutHarness:
             if recorder is not None:
                 recorder("settle", k, None)
 
-        metrics = RolloutMetrics(self.num_envs, fit, self.device, episode_steps)
+        metrics = RolloutMetrics(
+            self.num_envs,
+            fit,
+            self.device,
+            episode_steps,
+            descriptor=self.descriptor,
+            control_dt=self.control_dt,
+        )
         metrics.begin(self.base_pos())
 
         # Collected as dense (T, N, ...) stacks and masked ONCE at the end.
@@ -349,7 +388,9 @@ class PolicyRolloutHarness:
 
             was_alive = alive.clone()
             gravity = self.projected_gravity()
-            metrics.update(self.base_pos(), gravity, self.foot_contact())
+            metrics.update(
+                self.base_pos(), gravity, self.foot_contact(), self.gait_extras()
+            )
             alive = ~metrics.fallen
             just_fell = was_alive & ~alive
 

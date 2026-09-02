@@ -8,6 +8,17 @@ therefore invalid, so every elite of both archives is re-evaluated here and the
 table leads with what came back. Archived values are shown underneath, with the
 optimism gap made explicit.
 
+**And it leads with *surviving-elite* coverage, not raw coverage.** Raw coverage
+counts every filled cell, whatever is in it. Under v1's fall-penalty objective
+almost every cell held a policy that falls — the CPG archive covered 85% of the
+grid and, re-measured, not one of its top 64 elites survived a full episode — so
+raw coverage compared between a penalty archive and a survival-gated one is not
+a comparison of anything. Surviving-elite coverage counts only cells whose elite
+is a **replay-verified** full-episode survivor, which is like-for-like: it asks
+both pipelines the same question, "how much of the behaviour space can this
+robot reach without falling over". Raw coverage is still reported, underneath,
+with the caveat attached.
+
     uv run python -m qd.compare_archives \\
         --a logs/qd/map_elites/archive_final.npz --a-label "MAP-Elites (CPG)" \\
         --b logs/qd/pga_me_matched/archive_final.npz --b-label "PGA-ME (MLP)" \\
@@ -64,6 +75,7 @@ def _measure(data: dict, args: Args, label: str) -> dict:
     out = {
         "label": label,
         "genome": infer_kind(data["solution"]),
+        "total_cells": total_cells,
         "elites": len(archived),
         "coverage": len(archived) / total_cells,
         "archived_qd_score": float(np.sum(archived - args.qd_score_offset)),
@@ -85,6 +97,19 @@ def _measure(data: dict, args: Args, label: str) -> dict:
 
     out.update(
         {
+            # The headline structural number: cells whose elite is a
+            # replay-verified survivor. Every elite occupies a distinct cell
+            # (that is what an archive is), so this counts cells.
+            "surviving_elites": int(survived.sum()),
+            "surviving_coverage": float(survived.sum()) / total_cells,
+            # ...and how many of those actually go somewhere. The spread
+            # criterion for walking-v2, at the threshold it was set at.
+            "surviving_cells_over_0.25m": int(
+                np.sum(survived & (info["displacement"] >= 0.25))
+            ),
+            "surviving_cells_over_0.50m": int(
+                np.sum(survived & (info["displacement"] >= 0.50))
+            ),
             "replay_qd_score": float(np.sum(fitness - args.qd_score_offset)),
             "replay_best": float(fitness.max()),
             "replay_mean": float(fitness.mean()),
@@ -136,9 +161,15 @@ def main(args: Args | None = None) -> None:
     for ax, grid, s in ((axes[0], grid_a, a), (axes[1], grid_b, b)):
         im = ax.imshow(grid.T, origin="lower", extent=extent, vmin=vmin, vmax=vmax,
                        cmap="viridis", aspect="equal")
+        surviving = (
+            f"  survivors {s['surviving_elites']} "
+            f"({s['surviving_coverage'] * 100:.1f}% of the grid)"
+            if "surviving_elites" in s
+            else ""
+        )
         ax.set_title(
             f"{s['label']} — {basis} fitness\n"
-            f"coverage {s['coverage'] * 100:.1f}%  "
+            f"raw coverage {s['coverage'] * 100:.1f}%{surviving}\n"
             f"QD {s[basis + '_qd_score']:.0f}  best {s[basis + '_best']:+.3f} m"
         )
         ax.set_xlabel(MEASURE_NAMES[0].replace("_", " "))
@@ -178,6 +209,13 @@ def main(args: Args | None = None) -> None:
     write_json(out / "comparison.json", payload)
 
     rows = [
+        ("LOCOMOTION — replay-verified survivors only", None, None),
+        ("surviving elites", "surviving_elites", "{:d}"),
+        ("surviving-elite coverage", "surviving_coverage", "{:.1%}"),
+        ("furthest by a survivor", "max_displacement_of_survivors_m", "{:+.3f} m"),
+        ("median travel of survivors", "median_displacement_of_survivors_m", "{:+.3f} m"),
+        ("cells with a survivor >= 0.25 m", "surviving_cells_over_0.25m", "{:d}"),
+        ("cells with a survivor >= 0.50 m", "surviving_cells_over_0.50m", "{:d}"),
         ("HONEST — every elite re-evaluated", None, None),
         ("best-cell fitness", "replay_best", "{:+.4f} m"),
         ("QD-score", "replay_qd_score", "{:.1f}"),
@@ -187,15 +225,13 @@ def main(args: Args | None = None) -> None:
         ("longest upright", "max_upright_s", "{:.2f} s"),
         ("median upright", "median_upright_s", "{:.2f} s"),
         ("furthest travelled", "max_displacement_m", "{:+.3f} m"),
-        ("furthest by a survivor", "max_displacement_of_survivors_m", "{:+.3f} m"),
-        ("median travel of survivors", "median_displacement_of_survivors_m", "{:+.3f} m"),
         ("ARCHIVED — optimistic, shown for reference", None, None),
         ("archived best-cell fitness", "archived_best", "{:+.4f} m"),
         ("archived QD-score", "archived_qd_score", "{:.1f}"),
         ("archive optimism (mean)", "archive_optimism_mean", "{:+.4f} m"),
-        ("STRUCTURE", None, None),
+        ("STRUCTURE — raw, counts fallen elites too", None, None),
         ("elites", "elites", "{:d}"),
-        ("coverage", "coverage", "{:.1%}"),
+        ("raw coverage", "coverage", "{:.1%}"),
     ]
     print(f"\n| metric | {a['label']} | {b['label']} |")
     print("| --- | --- | --- |")

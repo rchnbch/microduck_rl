@@ -268,3 +268,55 @@ def test_ppo_teacher_applies_the_observation_normalizer():
     teacher = PpoTeacher(sd, eps=0.0)
     obs = torch.full((1, 4), 5.0)
     torch.testing.assert_close(teacher(obs), torch.ones(1, 4))
+
+
+def test_commands_default_to_a_single_forward_walk():
+    from qd.seed import SeedCfg, commands_of
+
+    assert commands_of(SeedCfg()) == ((SeedCfg().teacher_vx, 0.0, 0.0),)
+    multi = SeedCfg(teacher_commands=((0.1, 0.0, 0.0), (0.4, 0.0, 0.0)))
+    assert commands_of(multi) == ((0.1, 0.0, 0.0), (0.4, 0.0, 0.0))
+
+
+def test_seed_family_splits_the_jitter_budget_across_seeds():
+    """Every seed needs its own neighbourhood: they sit far apart in descriptor
+    space, and the cells between them are filled by their clouds."""
+    from qd.seed import seed_family
+
+    g = torch.Generator().manual_seed(0)
+    seeds = torch.arange(3 * 8, dtype=torch.float32).reshape(3, 8)
+    family = seed_family(seeds, count=30, sigmas=0.02, generator=g)
+    assert family.shape == (3 + 30, 8)
+    # The seeds themselves come first, unperturbed — a distilled walker must be
+    # offered to the archive exactly as it was verified.
+    torch.testing.assert_close(family[:3], seeds)
+    # Each seed's cloud sits on that seed, not on seed 0.
+    for i in range(3):
+        cloud = family[3 + i * 10 : 3 + (i + 1) * 10]
+        assert (cloud - seeds[i]).abs().max() < 0.2
+
+
+def test_seed_family_of_one_seed_matches_plain_jitter():
+    from qd.seed import jitter, seed_family
+
+    seeds = torch.zeros(1, 8)
+    a = seed_family(seeds, 10, 0.02, torch.Generator().manual_seed(1))
+    b = torch.cat([seeds, jitter(seeds, 10, 0.02, torch.Generator().manual_seed(1))])
+    torch.testing.assert_close(a, b)
+
+
+def test_seed_family_splits_across_the_sigma_ladder_too():
+    """The useful jitter radius is not known in advance, so the block probes
+    several — the budget divides over (seed, sigma) pairs."""
+    from qd.seed import seed_family
+
+    g = torch.Generator().manual_seed(0)
+    seeds = torch.zeros(2, 8)
+    family = seed_family(seeds, count=40, sigmas=(0.01, 0.08), generator=g)
+    # 2 seeds + 4 clouds of 10.
+    assert family.shape == (2 + 40, 8)
+    clouds = [family[2 + i * 10 : 2 + (i + 1) * 10] for i in range(4)]
+    narrow = [c.std().item() for c in (clouds[0], clouds[2])]
+    wide = [c.std().item() for c in (clouds[1], clouds[3])]
+    assert max(narrow) < min(wide), "the ladder collapsed to one radius"
+    assert min(wide) > 5 * max(narrow)

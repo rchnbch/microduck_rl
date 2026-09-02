@@ -73,7 +73,7 @@ from qd.pga.variation import (
     pg_variation,
     sample_parents,
 )
-from qd.seed import SeedCfg, jitter
+from qd.seed import SeedCfg, seed_family
 
 
 @dataclass
@@ -229,20 +229,18 @@ def main(args: Args | None = None) -> None:
     seed_info: dict = {}
     if args.seed_genome is not None:
         with np.load(args.seed_genome) as f:
-            seed_genome = torch.as_tensor(
+            seeds = torch.as_tensor(
                 f["genome"], dtype=torch.float32, device=args.device
-            ).reshape(1, -1)
-        trainer.set_greedy(seed_genome)
-        family = torch.cat(
-            [
-                seed_genome,
-                jitter(
-                    seed_genome,
-                    args.seeding.jitter_count,
-                    args.seeding.jitter_sigma,
-                    generator,
-                ),
-            ]
+            ).reshape(-1, spec.genome_dim)
+        # `qd.seed` can distil several twist commands into several genomes; the
+        # greedy actor gets the first, and each seed contributes its own
+        # jittered neighbourhood so the archive opens across the descriptor.
+        trainer.set_greedy(seeds[:1])
+        family = seed_family(
+            seeds,
+            args.seeding.jitter_count,
+            args.seeding.jitter_sigmas or args.seeding.jitter_sigma,
+            generator,
         )
         # The seed family fills one rollout; whatever is left over goes to
         # random MLPs, which cost nothing extra (the world count is fixed) and
@@ -257,9 +255,11 @@ def main(args: Args | None = None) -> None:
         )[:num_envs]
         info, _, _ = evaluate_and_insert(block)
         evals += num_envs
+        n_seeds = len(seeds)
         seed_info = {
-            "seed_survived": bool(~info["fell"][0]),
-            "seed_displacement_m": float(info["displacement"][0]),
+            "seeds": n_seeds,
+            "seeds_survived": int((~info["fell"][:n_seeds]).sum()),
+            "seed_displacements_m": info["displacement"][:n_seeds].tolist(),
             "seed_family_size": len(family),
             "seed_family_feasible": int((~info["fell"][: len(family)]).sum()),
             "seed_family_max_displacement_m": float(
@@ -267,10 +267,12 @@ def main(args: Args | None = None) -> None:
             ),
         }
         print(
-            f"seed: survived={seed_info['seed_survived']} "
-            f"displacement={seed_info['seed_displacement_m']:+.3f} m | "
-            f"{seed_info['seed_family_feasible']}/{len(family)} of the seed "
-            f"family feasible, furthest {seed_info['seed_family_max_displacement_m']:+.3f} m",
+            f"seeds: {seed_info['seeds_survived']}/{n_seeds} survived, "
+            f"displacements "
+            + " ".join(f"{d:+.2f}" for d in seed_info["seed_displacements_m"])
+            + f" m | {seed_info['seed_family_feasible']}/{len(family)} of the "
+            f"seed family feasible, furthest "
+            f"{seed_info['seed_family_max_displacement_m']:+.3f} m",
             flush=True,
         )
 

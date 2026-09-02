@@ -73,6 +73,23 @@ class SeedCfg:
     clear of its ``walking_threshold`` of 0.01, so the teacher is unambiguously
     in its walking regime rather than its standing one."""
 
+    teacher_commands: tuple[tuple[float, float, float], ...] = ()
+    """``(vx, vy, wz)`` twist commands to distil, one student genome each.
+
+    Empty means "just ``teacher_vx`` forward". Several commands means several
+    seeds, and that is a diversity lever, not a convenience: the descriptor is
+    per-foot duty factor, and the map from MLP weights to duty factor turns out
+    to be *flat* near a walker — GA variation at the largest per-weight step
+    that still leaves the policy upright barely moves the duty factors, so a
+    single-seed archive stalls at the seed's own neighbourhood. The teacher, by
+    contrast, walks differently on command: a 0.1 m/s shuffle, a 0.4 m/s stride
+    and a turn-in-place are structurally different gaits that are all feasible
+    by construction. Distilling several of them opens the archive across the
+    descriptor instead of at one point in it.
+
+    Every command still yields a policy the archive sees under a **zero**
+    observation, since the command is baked into the weights."""
+
     rounds: int = 4
     """DAgger rounds. Round 0 rolls the teacher out; later rounds roll the
     student out and label with the teacher."""
@@ -93,7 +110,24 @@ class SeedCfg:
     """Per-weight Gaussian sigma for the jitter, in genome units.
 
     4x the ``iso_sigma`` GA variation uses: the point is to *spread* the
-    initial archive, and at 0.005 every variant lands in the seed's own cell."""
+    initial archive, and at 0.005 every variant lands in the seed's own cell.
+    Only used when ``jitter_sigmas`` is empty."""
+
+    jitter_sigmas: tuple[float, ...] = (0.01, 0.02, 0.04, 0.08)
+    """A ladder of jitter radii, the budget split evenly across them.
+
+    One radius is a guess at a quantity nobody knows in advance: how far a
+    genome can be pushed before it stops walking, in a direction that actually
+    changes its duty factor. A ladder measures it instead — the wide rungs will
+    mostly fall over and the narrow ones will mostly land in the seed's own
+    cell, and whichever rung is in between fills cells.
+
+    Note this is *isotropic* noise, and it survives magnitudes that
+    :mod:`qd.pga.tune_pg` found lethal for gradient steps: 0.02 here is a mean
+    per-weight drift of 1.6e-2, well past the 6e-3 at which coherent PG steps
+    kill a policy outright, and yet ~40% of the cloud still walks. A random
+    direction in 9038 dimensions is near-orthogonal to any particular harmful
+    one; a gradient direction is not."""
 
 
 # --------------------------------------------------------------------------- #
@@ -170,6 +204,11 @@ def _check_layout(harness: PolicyRolloutHarness) -> None:
     raise RuntimeError("no 'command' term in the actor observation group")
 
 
+def commands_of(cfg: SeedCfg) -> tuple[tuple[float, float, float], ...]:
+    """The twist commands to distil; ``teacher_vx`` forward if none are given."""
+    return cfg.teacher_commands or ((cfg.teacher_vx, 0.0, 0.0),)
+
+
 def distil_seed(
     teacher: PpoTeacher,
     harness: PolicyRolloutHarness,
@@ -177,6 +216,7 @@ def distil_seed(
     spec: PolicySpec = DEFAULT_SPEC,
     generator: torch.Generator | None = None,
     verbose: bool = True,
+    command: tuple[float, float, float] | None = None,
 ) -> tuple[torch.Tensor, list[dict]]:
     """Behaviour-clone ``teacher`` into one genome. Returns ``(genome, log)``."""
     _check_layout(harness)
@@ -184,12 +224,14 @@ def distil_seed(
     generator = generator or torch.Generator(device=device).manual_seed(0)
     student = spec.initial_population(1, generator, device).requires_grad_(True)
     opt = torch.optim.Adam([student], lr=cfg.learning_rate)
+    twist = torch.tensor(
+        command if command is not None else (cfg.teacher_vx, 0.0, 0.0),
+        device=device,
+    )
 
     def teacher_action(obs: torch.Tensor) -> torch.Tensor:
         commanded = obs.clone()
-        commanded[:, TWIST_SLICE] = torch.tensor(
-            [cfg.teacher_vx, 0.0, 0.0], device=obs.device
-        )
+        commanded[:, TWIST_SLICE] = twist
         return teacher(commanded)
 
     obs_bank: list[torch.Tensor] = []
@@ -287,6 +329,31 @@ def jitter(
     return seed + sigma * noise
 
 
+def seed_family(
+    seeds: torch.Tensor,
+    count: int,
+    sigmas: float | tuple[float, ...],
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """The seeds themselves, then a jittered cloud per (seed, sigma) pair.
+
+    ``count`` is the *total* jitter budget, split evenly over the cross product:
+    six distilled commands, four radii and ``jitter_count`` 240 gives 10 per
+    cloud. Splitting across seeds matters because they explore different
+    weight-space neighbourhoods; splitting across radii matters because the
+    useful radius — wide enough to move the duty factor, narrow enough to keep
+    the policy upright — is not known in advance.
+    """
+    seeds = seeds.reshape(-1, seeds.shape[-1])
+    ladder = (sigmas,) if isinstance(sigmas, (int, float)) else tuple(sigmas)
+    pairs = [(i, s) for i in range(len(seeds)) for s in ladder]
+    per_cloud = max(1, count // len(pairs)) if count > 0 else 0
+    return torch.cat(
+        [seeds]
+        + [jitter(seeds[i : i + 1], per_cloud, s, generator) for i, s in pairs]
+    )
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -328,45 +395,66 @@ def main(args: Args | None = None) -> None:
             f"contract is {DEFAULT_SPEC.obs_dim}-D"
         )
 
-    genome, log = distil_seed(teacher, harness, args.seeding, generator=generator)
+    commands = commands_of(args.seeding)
+    genomes, verdicts = [], []
+    for command in commands:
+        print(f"\ndistilling twist command {command}", flush=True)
+        genome, log = distil_seed(
+            teacher, harness, args.seeding, generator=generator, command=command
+        )
+        genomes.append(genome)
 
-    # The number that matters: does the *student* walk, on its own, under the
-    # physics the archive will judge it by?
-    fitness, measures, info, _ = harness.rollout(
-        genome.expand(args.num_envs, -1).contiguous(), collect=False
-    )
-    verdict = {
-        "checkpoint": str(args.checkpoint),
-        "teacher_vx": args.seeding.teacher_vx,
-        "full_collision": args.full_collision,
-        "episode_seconds": args.fitness.episode_seconds,
-        "seed_survived": bool(~info["fell"][0]),
-        "seed_displacement_m": float(info["displacement"][0]),
-        "seed_fitness_m": float(fitness[0]),
-        "seed_duty": [float(measures[0, 0]), float(measures[0, 1])],
-        # The seed is one genome in num_envs identical worlds: the spread over
-        # those worlds IS this simulator's closed-loop non-determinism, measured
-        # on the very policy that has to survive it.
-        "replica_survival_rate": float((~info["fell"]).mean()),
-        "replica_displacement_mean_m": float(info["displacement"].mean()),
-        "replica_displacement_min_m": float(info["displacement"].min()),
-        "replica_displacement_max_m": float(info["displacement"].max()),
-        "dagger": log,
-    }
+        # The number that matters: does the *student* walk, on its own, under
+        # the physics the archive will judge it by? Evaluated as num_envs
+        # identical replicas, so the spread IS this simulator's closed-loop
+        # non-determinism, measured on the very policy that has to survive it.
+        fitness, measures, info, _ = harness.rollout(
+            genome.expand(args.num_envs, -1).contiguous(), collect=False
+        )
+        verdict = {
+            "command": list(command),
+            "seed_survived": bool(~info["fell"][0]),
+            "seed_displacement_m": float(info["displacement"][0]),
+            "seed_fitness_m": float(fitness[0]),
+            "seed_duty": [float(measures[0, 0]), float(measures[0, 1])],
+            "replica_survival_rate": float((~info["fell"]).mean()),
+            "replica_displacement_mean_m": float(info["displacement"].mean()),
+            "replica_displacement_min_m": float(info["displacement"].min()),
+            "replica_displacement_max_m": float(info["displacement"].max()),
+            "dagger": log,
+        }
+        verdicts.append(verdict)
+        print(
+            f"seed {command}: survived={verdict['seed_survived']} "
+            f"displacement={verdict['seed_displacement_m']:+.3f} m  "
+            f"duty=({measures[0, 0]:.2f}, {measures[0, 1]:.2f})  |  "
+            f"across {args.num_envs} identical replicas: "
+            f"{verdict['replica_survival_rate'] * 100:.1f}% survive, "
+            f"{verdict['replica_displacement_min_m']:+.3f} .. "
+            f"{verdict['replica_displacement_max_m']:+.3f} m",
+            flush=True,
+        )
+
+    stacked = torch.cat(genomes)
+    duties = [v["seed_duty"] for v in verdicts]
     print(
-        f"\nseed: survived={verdict['seed_survived']} "
-        f"displacement={verdict['seed_displacement_m']:+.3f} m  "
-        f"duty=({measures[0, 0]:.2f}, {measures[0, 1]:.2f})\n"
-        f"across {args.num_envs} identical replicas: "
-        f"{verdict['replica_survival_rate'] * 100:.1f}% survive, displacement "
-        f"{verdict['replica_displacement_min_m']:+.3f} .. "
-        f"{verdict['replica_displacement_max_m']:+.3f} m",
+        f"\n{len(commands)} seed(s), duty factors "
+        + ", ".join(f"({d[0]:.2f}, {d[1]:.2f})" for d in duties),
         flush=True,
     )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(args.out, genome=genome.cpu().numpy())
-    write_json(args.out.with_suffix(".json"), verdict)
+    np.savez_compressed(args.out, genome=stacked.cpu().numpy())
+    write_json(
+        args.out.with_suffix(".json"),
+        {
+            "checkpoint": str(args.checkpoint),
+            "full_collision": args.full_collision,
+            "episode_seconds": args.fitness.episode_seconds,
+            "commands": [list(c) for c in commands],
+            "seeds": verdicts,
+        },
+    )
     print(f"wrote {args.out} and {args.out.with_suffix('.json')}")
 
 

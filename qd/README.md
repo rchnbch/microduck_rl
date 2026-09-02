@@ -10,20 +10,34 @@ its kind. Here the descriptor is per-foot ground-contact duty factor, so the
 archive spans everything from a shuffle that never lifts a foot to a hopping
 gait with both feet airborne most of the time.
 
+> **Read [Walking v2](#walking-v2--survival-gated-ppo-seeded-pga-me) first if you
+> want the current state.** v1 (Phases 2-3, below) is the baseline record: it
+> produced archives full of policies that *fall over*, because falling was
+> priced rather than forbidden. v2 makes not-falling a feasibility constraint,
+> fixes the physics the fall was measured under, and starts the search from the
+> PPO walker. Everything below v1's Results section still describes machinery
+> v2 uses unchanged.
+
 ```
 qd/
 ├── common.py          fitness + behaviour descriptor + archive/plot/checkpoint helpers
 ├── cpg_genome.py      Phase 2 genome: 31-parameter open-loop CPG
 ├── evaluate.py        batched mjlab rollout harness: genomes -> (fitness, descriptor)
 ├── run_map_elites.py  Phase 2 CLI: pyribs GridArchive + GaussianEmitter ask/tell loop
+├── seed.py            v2: distil the PPO walker into the genome (DAgger)
 ├── play_elite.py      inspect / replay one elite from a saved archive
 ├── check_harness.py   physics sanity checks — run before any long run
+├── check_floor.py     v2: is any part of the robot under the plane?
+├── check_repeatability.py  v2: how much is one evaluation worth? (not much)
+├── verify_archive.py  v2: re-roll every elite N times; keep the ones that are real
 ├── bench.py           throughput + evaluation-noise benchmark: pick a batch size
-├── survival_report.py   re-evaluate the top elites: survival + archive optimism
-├── compare_archives.py  side-by-side CPG vs PGA-ME comparison
+├── bench_collision.py v2: what full-body ground collision costs
+├── survival_report.py   re-evaluate elites: survival + archive optimism
+├── compare_archives.py  side-by-side archive comparison
 ├── render_gaits.py      rollout -> mp4 clips of each elite's gait
 ├── build_viewer.py      the clickable archive viewer page
 └── pga/               Phase 3: PGA-MAP-Elites (see below)
+    └── tune_pg.py     v2: how hard PG variation can push before it breaks a walker
 ```
 
 Before the first long run on a new machine or after touching the MJCF:
@@ -34,12 +48,16 @@ uv run python -m qd.bench           # ms/genome vs batch size, fitness noise
 ```
 
 After a run, to see whether the elites actually *walk* rather than just score
-well — the pro-rata penalty means a high fitness can come either from covering
-ground fast before falling or from staying up, and the archive does not record
-which:
+well. In a v1 archive that is a question about the objective — the pro-rata
+penalty means a high fitness can come either from covering ground fast before
+falling or from staying up, and the archive does not record which. In a gated
+v2 archive every member survived on insertion, so the question becomes whether
+they *still* do, and how far they get, over replicas:
 
 ```bash
 uv run python -m qd.survival_report --archive logs/qd/map_elites/archive_final.npz
+uv run python -m qd.survival_report --archive logs/qd/pga_me_v2/archive_final.npz \
+    --sample 64 --replicas 8
 ```
 
 ## Install
@@ -233,7 +251,13 @@ interleaves neck/head between the legs, so a hard-coded `0..9` slice grabs the
 head), the two-layer bound enforcement, the fall latch, and the descriptor
 staying inside `[0, 1]²` where the `GridArchive` can see it.
 
-## Results
+## Results — v1
+
+**This section is the baseline record, kept as it was written.** Its numbers
+were measured under v1's physics (ground collision on the two foot soles only,
+rollouts continuing past the fall). Re-measured under v2's physics they get
+worse, and [Walking v2](#walking-v2--survival-gated-ppo-seeded-pga-me) says by
+how much.
 
 Both pipelines run to **~207,000 evaluations** on one RTX 3060 (MAP-Elites
 206,848 in 31 min; PGA-ME 207,048 in 74 min), same archive, same objective,
@@ -276,6 +300,14 @@ re-running the genomes. Reproduce with
 1.3 cm/s, about a third of a body length in the whole episode — standing still
 with extra steps. The elite that travels furthest (+0.403 m) falls before the
 episode ends. Nothing in either archive both stays up and goes anywhere.
+
+> **And that lone survivor does not survive honest physics.** Re-measured under
+> v2's model — every shell colliding with the ground rather than the two soles
+> — the top 64 elites of *both* v1 archives contain **zero** full-episode
+> survivors: longest upright 4.70 s for the MLP archive and 1.82 s for the CPG,
+> against archived claims of 7.00 s and 2.10 s. The v1 MLP archive is also
+> +0.277 m optimistic on that re-measurement. So the count of survivors in v1
+> is not one. It is none.
 
 That is the real state of this work, and it is worth stating plainly because
 every aggregate metric above hides it: fitness rewards distance *and* staying
@@ -383,6 +415,12 @@ are measured under identical physics.
 
 ### Per-step reward — an exact decomposition of the episodic fitness
 
+> **Superseded in v2** — see
+> [the shaped per-step reward](#3-ppo-seeding-and-a-shaped-critic). Once
+> survival is a constraint rather than a term in the objective, the critic's
+> job is to teach balance, and this reward does not contain balance. What
+> survives is the velocity term's scale.
+
 ```
 r_t        = forward_velocity * dt                          while upright
 r_terminal = -fall_penalty * (steps_left / total_steps)     on the fall, done=1
@@ -418,11 +456,18 @@ emitter. The greedy actor is evaluated and inserted alongside them each
 iteration.
 
 Hyperparameters follow QDax's `pga_me` / `td3` defaults (consulted directly):
-`proportion_mutation_ga` 0.5, `num_critic_training_steps` 300,
-`num_pg_training_steps` 100, replay buffer 1e6, transition batch 256, critic and
-greedy-actor LR 3e-4, offspring policy LR 1e-3, `policy_noise` 0.2,
-`noise_clip` 0.5, `policy_delay` 2, `soft_tau_update` 0.005, discount 0.99,
-`iso_sigma` 0.005, `line_sigma` 0.05. Critic hidden layers are `(256, 256)`.
+`proportion_mutation_ga` 0.5, `num_critic_training_steps` 300, replay buffer
+1e6, transition batch 256, critic LR 3e-4, `policy_noise` 0.2, `noise_clip`
+0.5, `policy_delay` 2, `soft_tau_update` 0.005, discount 0.99, `iso_sigma`
+0.005, `line_sigma` 0.05. Critic hidden layers are `(256, 256)`.
+
+**Three of QDax's defaults do not survive v2** — `num_pg_training_steps` 100 ->
+30, offspring policy LR 1e-3 -> 3e-5, greedy-actor LR 3e-4 -> 1e-6. They are
+tuned for a search that starts from random policies, where a large policy move
+costs nothing because there is nothing yet to break; here they destroy the
+seeded walker outright.
+[QDax's step sizes destroy a walker](#what-the-gate-exposed-qdaxs-step-sizes-destroy-a-walker)
+has the measurements.
 
 ### Per-operator insertion rates
 
@@ -432,25 +477,686 @@ correctness signal, not a curiosity: **PG insertions near zero means the critic
 or the reward wiring is broken**, and the fix is to debug it, not to ship the
 run.
 
+
+## Walking v2 — survival-gated, PPO-seeded PGA-ME
+
+v1's verdict, in one line: *the ducks fall over*. 561 training-time survivors
+across the whole PGA-ME run, exactly one of which survived a replay, and that
+one covered 8.8 cm in seven seconds. The archive was full of policies optimised
+to dive well.
+
+Nothing was broken. The objective was doing exactly what it said:
+
+```
+fitness = displacement_at_fall - 0.25 * fraction_of_episode_fallen
+```
+
+A policy that covers 0.4 m and falls at 2 s of a 7 s episode scores +0.22. A
+policy that stays upright and goes nowhere scores 0.00. **The dive wins**, and
+MAP-Elites is very good at finding what wins. Charging by time-down made
+falling *late* cheaper than falling early, which is the right shape, but it
+never made falling *unacceptable*.
+
+Three changes, and they are meant to be read together — the gate is only
+meaningful if the fall is measured honestly, and the gate is only survivable if
+the search starts somewhere feasible.
+
+### 1. Honest physics
+
+Two problems, one in the model and one in the loop.
+
+**The model.** `robot_walk.xml` gives ground-collision geoms to the two foot
+soles; the trunk, head, hips and thighs are `contype=0` or self-collision-only.
+That is sound for PPO, which *terminates* the episode at the fall and never
+simulates what happens next. A QD rollout kept going for the full 7 s, and a
+toppled robot sank through the plane. v2 uses `robot_allcollisions.xml` — the
+same robot, same HOME frame, same BAM actuators, the shells given ground
+contacts (`qd.evaluate.HarnessCfg.full_collision`, default on for both
+pipelines so CPG and MLP archives stay measured under identical physics).
+
+**The loop.** The rollout now stops at the fall: a fallen world stops
+contributing to fitness, descriptor, replay transitions and recorded `qpos`,
+and the loop breaks entirely once nothing is upright. `RolloutMetrics` keeps
+the *full* episode length as the denominator for the fallen fraction, so
+stopping early does not make everything read as 100% alive.
+
+How far under the floor did v1 go? `qd.check_floor` rolls out 64 falling random
+MLPs and computes the exact lowest mesh vertex on the worst frame — every
+geom's vertices transformed into the world, not a bounding-sphere estimate:
+
+| | lowest point of the robot | what the frame looks like |
+| --- | --- | --- |
+| v1 (feet only, runs past the fall) | **-0.276 m** | two foot geoms floating on an empty plane; the duck is *gone* |
+| v2 (full collision, stops at the fall) | **-0.013 m** | a duck lying face-down on the floor |
+
+-0.013 m is a head shell at a contact, i.e. ordinary solver interpenetration on
+a 25 cm robot. -0.276 m is the whole robot below the world.
+
+```bash
+MUJOCO_GL=glfw uv run python -m qd.check_floor --num-envs 64 \
+    --dump-frames logs/qd/floor_frames --out logs/qd/floor_check.json
+```
+
+**One thing full collision does cost: constraint budget.** More geoms touching
+the ground means more constraints, and mjlab's default allocation is sized for
+the foot-only model. Under `full_collision`, `qd.check_harness` printed
+`nefc overflow - please increase njmax to 91` on a robot lying on its side. An
+nefc overflow silently *drops* constraints — it quietly makes the floor soft
+again, which is exactly the bug `full_collision` exists to fix, reappearing on
+the frames where honest physics matters most. `HarnessCfg.njmax` is pinned to
+128. Only the low-level Phase-2 path was affected; the Phase-3
+`ManagerBasedRlEnv` path sizes this itself and logged zero overflows across
+both full runs.
+
+The measured constants survive the model swap, which is the check AGENTS.md
+insists on: settled trunk z **0.1151 m** under all-collisions against v1's
+0.115 m, 40 mm of margin over the 0.075 m fall threshold, and a passive HOME
+hold still toppling at **1.34 s**.
+
+**What it costs in time: nothing.** `qd.bench_collision` at batch 1024 on an RTX 3060,
+identical population in all four rows:
+
+| collision | stops at fall | s/generation | ms/genome |
+| --- | --- | --- | --- |
+| feet only (v1) | no | 15.60 | 15.23 |
+| feet only | yes | 14.58 | 14.24 |
+| full body | no | 16.34 | 15.96 |
+| **full body (v2)** | **yes** | **15.61** | **15.24** |
+
+Full-body collision costs 1.05x per generation. Stopping at the fall gives it
+back (a random MLP is down inside 1.5 s of a 7 s episode). **Net v1 -> v2:
+1.00x.** The honest physics was free; it just had to be asked for.
+
+### 2. The survival gate
+
+Only solutions upright for the **whole** episode are inserted. Not-falling is a
+feasibility constraint, not a term in the objective.
+
+The fitness formula is **unchanged** — deliberately. For a full-episode
+survivor `fallen_fraction` is 0, so the pro-rata penalty is arithmetically inert
+inside a gated archive and the archived objective *is* forward displacement.
+Leaving v1's expression alone is what keeps a v1 archive and a v2 archive
+comparable at all: same objective, same descriptor, same grid, different
+admission rule.
+
+Two rates are logged per operator per iteration:
+
+* **feasibility rate** — what fraction of this operator's offspring stayed up.
+  This is the curve that says whether the search is living inside the
+  constraint or bouncing off it.
+* **insertion rate** — measured over the *whole* block, v1's denominator, so
+  the per-operator numbers remain comparable across the two runs.
+
+If the feasible set were empty at initialisation the run would need an
+episode-length ramp. It never was: even 1024 randomly initialised MLPs produce
+~65 full-episode survivors (a random tanh net often holds a static crouch), and
+with the seed below the archive opens with dozens.
+
+### 3. PPO seeding, and a shaped critic
+
+**The seed.** `qd/seed.py` takes the Phase-1 PPO velocity walker and distils it
+into the genome architecture. A weight copy is not available: the rsl_rl actor
+is `61 -> 512 -> 256 -> 128 -> 14` with ELU and a **linear** output head behind
+an `EmpiricalNormalization` layer, while the genome is `61 -> 64 -> 64 -> 14`
+with tanh throughout. Retraining PPO at 64x64 would fix the widths and the
+normalizer folds exactly into the first layer, but the output nonlinearity would
+still not match — and tanh on the output is not cosmetic, it is what bounds the
+action space TD3's target-policy smoothing clips its noise against.
+
+So: behaviour cloning, with **DAgger**. Observation slot `[34:48]` is the
+previous action, so a student trained only on the teacher's trajectories sees
+the teacher's action history at training time and its own at deployment. That
+compounds, and here it compounds into a fall — visible in the log below as
+rounds 1 and 2, where the student drives and *nothing* survives, before round 3
+recovers:
+
+```
+round 0 (teacher driving)  89600 states  bc loss 0.00245  survivors 256/256  max displ +1.689 m
+round 1 (student driving) 106891 states  bc loss 0.00609  survivors   0/256  max displ +0.663 m
+round 2 (student driving) 124140 states  bc loss 0.00849  survivors   0/256  max displ +0.691 m
+round 3 (student driving) 213409 states  bc loss 0.00458  survivors 254/256  max displ +1.414 m
+```
+
+**The forward command lives in the weights, not the input.** The QD env pins all
+13 command slots to zero — v1's convention, and the deployment idle state — and
+under a zero twist command the PPO walker correctly stands still. So the teacher
+is queried at the observation with the twist-vx slot overwritten by
+`teacher_vx = 0.3` m/s, while the student is trained on the **unmodified**
+zero-command observation. The student that comes out walks forward when its
+input says "stand". The 61-D obs contract is untouched.
+
+The resulting seed, under v2 physics:
+
+| | |
+| --- | --- |
+| survives 7 s | yes |
+| displacement | **+1.27 m** |
+| duty factor (L, R) | (0.55, 0.51) — a real alternating gait |
+| across 256 identical replicas | **99.6% survive**, +0.94 m mean, -0.40 .. +1.62 m |
+
+That replica spread is not noise in the measurement; it *is* this simulator's
+closed-loop non-determinism, measured on the policy that has to live with it.
+
+```bash
+uv run python -m qd.seed \
+    --checkpoint logs/rsl_rl/qd_phase1_baseline/<run>/model_399.pt \
+    --out logs/qd/seeds/ppo_seed.npz
+```
+
+**The shaped per-step reward.** v1's critic was trained on bare forward velocity
+with a terminal fall penalty, chosen so the undiscounted return equalled the
+episodic fitness *exactly*. That identity was the right call while fitness was
+the only thing standing between the search and a face-plant. With survival now a
+constraint, the critic's job changes: what PG variation needs from it is a dense
+signal for **balance**, which bare forward velocity does not contain — v1's
+critic could not tell a controlled step from the first frame of a dive. So
+(`qd.pga.evaluate.ShapedRewardCfg`):
+
+```
+r_t        = 1.0 * v_x * dt                                    # metres of progress
+           + (0.10 + 0.30 * clip(-projected_gravity_z, 0, 1)) * dt   # alive + upright
+r_terminal = -1.0 * (steps_left / total_steps)                 # on the fall
+```
+
+Weights are in metres, so the velocity term is still literally displacement and
+the critic keeps v1's scale. The 1:1 ratio between travel and posture is
+borrowed from the velocity task's own stack (`track_linear_velocity` weight 2.0
+against `upright` weight 2.0): at the 0.3 m/s the twist command tops out around,
+`upright_weight` pays the same per second as travel does. The upright term reads
+the same `projected_gravity_z` the fall check reads, so the critic is taught
+balance in the coordinate the gate actually measures. The fall penalty is 4x
+v1's, because it no longer has to stay small to avoid distorting an archive
+objective — inside a gated archive the terminal penalty is unreachable.
+
+**The exact-decomposition identity is deliberately abandoned**, and the test
+that pinned it now pins the narrower claim that survives: at `vel_weight` 1.0
+the velocity term alone still sums to displacement.
+
+### What the gate exposed: QDax's step sizes destroy a walker
+
+The first gated run had **PG insertion rate 0.0%, every iteration**, against GA
+at 3-5%. Per-operator feasibility said why: GA offspring survived ~40% of the
+time, PG offspring **0%**. PG variation was not failing to help — it was
+destroying the policies it was handed.
+
+The arithmetic is not subtle. Adam's per-parameter step is bounded by the
+learning rate, so `steps * lr` is a budget on how far the genome travels. QDax's
+default 100 offspring steps at 1e-3 moves every one of 9038 weights by up to
+0.1, against an initial weight scale of `1/sqrt(61) = 0.13`. That is a ~70%
+perturbation of the entire policy. In v1 this was invisible: everything fell
+anyway, so a destroyed offspring and an intact one scored about the same and PG
+still inserted 1.8% into fall-dominated cells.
+
+`qd/pga/tune_pg.py` measures the cliff instead of guessing at it — one real
+generation into the buffer, the critic trained exactly as an iteration would,
+then the same 40 parents mutated at each setting and all of them evaluated in
+one batched rollout. Parents were feasible 40% of the time:
+
+| steps | lr | mean per-weight drift | offspring feasible |
+| --- | --- | --- | --- |
+| 5 | 3e-5 | 1.1e-4 | 48% |
+| 5 | 3e-4 | 1.1e-3 | 45% |
+| **30** | **3e-5** | **6.3e-4** | **55%** |
+| 10 | 3e-4 | 2.1e-3 | 40% |
+| 30 | 1e-4 | 2.1e-3 | 52% |
+| 30 | 3e-4 | 5.8e-3 | **0%** |
+| 100 | 1e-3 *(QDax default)* | 2.9e-2 | **0%** |
+
+Feasibility holds to about 2e-3 of mean per-weight drift and collapses by 6e-3.
+The defaults are now **30 steps at 3e-5** — drift 6.3e-4, comfortably inside the
+safe region and still moving the genome ~5x further than the GA's iso term.
+
+```bash
+uv run python -m qd.pga.tune_pg --seed-genome logs/qd/seeds/ppo_seed.npz
+```
+
+### What the gate exposed, part two: one seed is not enough
+
+The first full gated run stalled. Elites went 7 -> 15 over nine iterations and
+then 15 -> 17 over the next ten, with insertion rates down at 0.0-0.2%. The
+tempting reading is "the search is converging"; the per-operator logs say
+otherwise. **Feasibility stayed healthy at 30-40%** — roughly 170 of 512 GA
+offspring per iteration were surviving the full episode, and essentially every
+one of them landed in a cell that was already filled.
+
+So the offspring were fine. They just were not *different*.
+
+**Near a walker, the map from MLP weights to duty factor is flat.** GA variation
+is already perturbing at the largest per-weight step that leaves the policy
+upright — `iso_sigma` 0.005 gives a mean per-weight drift of 4e-3, and
+`tune_pg` measured feasibility collapsing by 6e-3 — and at that step the duty
+factors barely move. Push harder and the policy dies. Push softer and the
+behaviour does not change. There is no setting of an isotropic weight-space
+mutation that buys behavioural diversity here, and that is a property of the
+genome-to-descriptor map, not of the hyperparameters.
+
+What *does* produce structurally different, feasible gaits is the thing that
+produced the seed in the first place. The PPO teacher walks differently **on
+command** — a 0.1 m/s shuffle, a 0.4 m/s stride, a forward-plus-turn — and every
+one of those is feasible by construction, which is what weight-space mutation
+cannot manufacture. So v2 distils several of them:
+
+```bash
+uv run python -m qd.seed \
+    --checkpoint logs/rsl_rl/qd_phase1_baseline/<run>/model_399.pt \
+    --out logs/qd/seeds/ppo_seeds.npz \
+    --seeding.teacher-commands "0.10 0.0 0.0" "0.20 0.0 0.0" "0.30 0.0 0.0" \
+                               "0.40 0.0 0.0" "0.25 0.15 0.0" "0.25 0.0 0.5"
+```
+
+Each seed keeps its command baked into its weights, so all of them are still
+policies the archive evaluates under a **zero** observation and the 61-D
+contract is untouched. `run_pga_me` gives every seed its own jittered
+neighbourhood (`jitter_count` split evenly), which costs no extra evaluations —
+the seed block is one fixed-size rollout either way, it simply spends fewer of
+its worlds on random MLPs.
+
+**Did it work? Partly, and not for the reason predicted.** The archive improved
+a lot — 38 elites by iteration 20 against the single-seed run's 17 by iteration
+19, with feasibility 55-87% against 30-40%. But the six commands did **not**
+spread the duty factors: they land within 0.03 of each other, which is under two
+cells. What helped was six different *weight-space* neighbourhoods and a ladder
+of jitter radii around each, not the commands separating in descriptor space.
+The next section is the measurement, and it is the more important result.
+
+The general point survives intact, and generalises past this robot: once
+not-falling is a constraint, the feasible set is a thin manifold, isotropic
+mutation cannot travel along it, and the archive's spread is set by how diverse
+its *feasible seeding* was. A richer answer would be a variation operator that
+moves along the manifold rather than across it — which is what PG variation is
+supposed to be, and would be if the critic knew about the descriptor. That is
+the obvious next thing to build, and it is not built here.
+
+### Negative result: per-foot duty factor barely varies among upright gaits
+
+This one is worth reading before designing another run on this archive, because
+it says the behaviour descriptor is not measuring much.
+
+Three independent measurements, all pointing the same way.
+
+**Commanded gaits that differ a lot in speed do not differ in duty factor.**
+The six distilled seeds come from twist commands spanning the velocity task's
+whole forward range, and the teacher's own displacement over 7 s spans 6x across
+them. Their duty factors span 0.03:
+
+| teacher command (vx, vy, wz) | teacher travels | seed duty (L, R) |
+| --- | --- | --- |
+| (0.10, 0, 0) | +0.41 m | (0.48, 0.57) |
+| (0.20, 0, 0) | +0.83 m | (0.46, 0.57) |
+| (0.30, 0, 0) | +1.64 m | (0.48, 0.55) |
+| (0.40, 0, 0) | +2.42 m | (0.49, 0.54) |
+| (0.25, 0.15, 0) — forward + strafe | +1.30 m | (0.47, 0.56) |
+| (0.25, 0, 0.5) — forward + turn | +1.24 m | (0.48, 0.57) |
+
+A shuffle and a stride, a straight walk and a turn, all inside two cells of a
+20x20 grid. Whatever distinguishes those gaits, this descriptor cannot see it.
+
+**Mutation cannot move it either.** GA variation runs at the largest per-weight
+step that leaves the policy upright (`iso_sigma` 0.005, mean drift 4e-3, against
+the ~6e-3 at which `tune_pg` measured feasibility collapsing), and at that step
+offspring stay feasible ~40-60% of the time and land almost entirely in cells
+that are already filled — that is the single-seed stall above, and it is a
+property of the genome-to-descriptor map rather than of the hyperparameters.
+
+**Chance cannot move it.** 256 byte-identical copies of one genome, whose
+*displacement* spreads with a standard deviation of 0.605 m, have a duty-factor
+standard deviation of **0.014** — about a quarter of a cell. The objective is
+chaotic and the descriptor is stable.
+
+So: the reachable-while-upright region of this descriptor is genuinely small,
+and v2's low raw coverage is mostly that, not a failure of search. v1's 73-85%
+raw coverage was overwhelmingly *fallen* policies, whose duty factors are set by
+how they happened to collapse — a robot lying on both soles reads (1, 1), a
+face-plant reads whatever its last upright step did. Coverage over a
+fall-populated archive is a measure of the ways this robot can fall.
+
+**Implication for the next run: change the descriptor, not the search.** Stride
+length, lateral drift, cost of transport, turning rate or trunk-pitch amplitude
+would all vary across the six gaits above, where duty factor does not. Per-foot
+duty factor is Cully et al.'s hexapod descriptor and it earns its reputation on
+a robot with six legs and many ways to distribute contact; on a biped that can
+only stay upright by alternating its two feet at roughly even duty, it is close
+to a constant. That is not an argument against QD here — it is an argument that
+the axes were the wrong ones, and picking better ones is cheap.
+
+### The greedy actor, and what TD3 is actually for here
+
+The greedy actor needed the same treatment for a subtler and more important
+reason. It takes ~150 updates *per iteration* (`num_critic_training_steps /
+policy_delay`), so its budget is 150x an offspring's. Measured survival
+fraction per iteration, over 8 iterations, starting from the seeded walker:
+
+```
+3e-4 (QDax)   1.00 0.06 ...            destroyed inside one iteration
+1e-5          1.00 1.00 0.20 0.16 ...  gone by iteration 3
+1e-6          1.00 1.00 1.00 1.00 ...  upright throughout
+```
+
+This matters far beyond the greedy actor's own insertions (it has essentially
+none, in v1 or v2). TD3 bootstraps its target off `greedy_target`:
+
+```
+target = r + gamma * min(Q1, Q2)(s', greedy_target(s'))
+```
+
+The critic therefore learns the value of *the greedy actor's* behaviour. Boot-
+strapping off a policy that face-plants at 1.3 s teaches a critic whose Q surface
+is about falling — and PG variation then gradient-ascends every elite toward
+that. Moving the greedy actor from 1e-5 to 1e-6 took PG offspring feasibility
+from ~45% to ~58%.
+
+**Be clear about what this means.** At 1e-6 the greedy actor is effectively
+*frozen near the seed*: over 200 iterations its total drift is on the order of
+the safe single-variation budget, so it improves barely if at all, and in the
+validation runs its own displacement decayed toward zero (the cold critic likes
+the alive and upright terms more than it likes travelling). TD3 in walking-v2 is
+therefore **not** an actor-learning algorithm. It is a critic-fitting algorithm
+whose actor's job is to keep the bootstrap anchored on states a survivor can
+actually reach. The gradient half of PGA-ME earns its place through PG variation
+of archive elites, not through the greedy actor. A version that wanted a genuinely
+learning greedy actor would need the critic warmed on survivor data before the
+actor is allowed to move — a curriculum on the learning rate — which is out of
+scope here and worth trying next.
+
+### The finding that reframes every number here: a walker's fitness is chaotic
+
+v1's Reproducibility section measured this simulator's evaluation noise on an
+open-loop CPG and got ~4 mm, then noted that a closed-loop MLP amplifies it
+~60x. Walking-v2's genomes are *walkers*, and the amplification is not 60x.
+
+`qd.check_repeatability` runs **N byte-identical copies of one genome in one
+batched rollout**, with every DR knob off, the spawn pinned, the actuator
+deterministic, and every world reset to the same state. The only thing that
+differs between worlds is MuJoCo-Warp's contact/constraint solve order. On the
+0.4 m/s seed, 256 copies:
+
+| | |
+| --- | --- |
+| survival | 98.8% |
+| displacement, median | **+1.565 m** |
+| displacement, standard deviation | **0.605 m** |
+| displacement, 5th-95th percentile | -0.051 .. +1.937 m |
+| displacement, full range | -0.796 .. +2.168 m |
+| duty factor, standard deviation | (0.014, 0.014) |
+| trunk-x spread between worlds | 1 mm at 0.04 s, 10 mm at 0.12 s, 100 mm at **0.52 s** |
+
+That divergence profile is exponential, which is what a marginally stable
+bipedal walker integrating 350 control steps is: a chaotic system. The same
+policy walks 2 m or falls backwards depending on the last bit of a contact
+force.
+
+Three consequences, and they run through everything above:
+
+1. **A single evaluation is nearly uninformative about displacement.** Report
+   medians over replicas. `qd.survival_report --replicas N` does this; the
+   displacement columns at `--replicas 1` are a coin flip and should be read
+   as such.
+
+2. **MAP-Elites is not merely optimistic here, it is systematically
+   luck-ranked.** It inserts on one sample and keeps the maximum per cell, so a
+   cell's archived value estimates its elite's *best luck* — measured at
+   **+0.60 m** above the median on this genome. This also explains the
+   insertion-rate collapse the run shows from about iteration 10: once every
+   cell holds a lucky draw, a genuinely better offspring loses to an incumbent's
+   good day, and the logged insertion rate stops being a measure of whether the
+   operators work. **Re-evaluation on insertion, or a running mean per cell, is
+   the fix, and it is not implemented here** — v1's README already listed it as
+   a known gap, and this measurement is what makes it urgent rather than
+   theoretical. Doing it properly costs a second evaluation per candidate, i.e.
+   half the archive at the same budget; that trade is worth measuring and was
+   out of scope for this pass.
+
+3. **Survival is much steadier than distance.** 98.8% versus a 0.6 m spread.
+   That asymmetry is why the survival gate works as a constraint at all: it is a
+   near-deterministic predicate on a chaotic system, so gating on it does not
+   inherit the chaos. It is also why the acceptance question "do the archived
+   elites really survive" gets a clean answer while "how far does elite k go"
+   only gets one over replicas.
+
+The duty-factor standard deviation of 0.014 is worth reading twice, next to the
+0.6 m in displacement. The **descriptor is stable while the objective is not** —
+about a quarter of a 0.05-wide cell, so an elite occasionally hops one cell.
+Combined with the flatness finding above, the picture is that this robot's
+behaviour space, as this descriptor sees it, is both narrow and stubborn: hard
+to move deliberately, and barely moved by chance.
+
+### The gate is necessary and not sufficient: re-evaluation on insertion
+
+The 200-iteration survival-gated run met the physics, wiring and locomotion
+criteria and failed the two honesty ones. Of 64 elites sampled uniformly from
+the archive and replayed 8 times each, **14 survived**. Verifying all 81 elites
+the same way left **7** that survive at least 7 of 8 replicas, holding **6**
+cells above 0.25 m.
+
+An archive that is 100% survivors by construction was 91% coin-flips in fact.
+
+**The proof of what went wrong is the seeds.** Six genomes went into the archive
+at iteration 0 with 99-100% measured replica survival, the most robust policies
+in the whole run by a wide margin. At iteration 200, **not one of them is in the
+archive**:
+
+```
+seed 0 (vx 0.10): evicted    seed 3 (vx 0.40): evicted
+seed 1 (vx 0.20): evicted    seed 4 (fwd+strafe): evicted
+seed 2 (vx 0.30): evicted    seed 5 (fwd+turn): evicted
+```
+
+Each was replaced, in its own cell, by a descendant that got a luckier single
+rollout. With displacement carrying a 0.605 m standard deviation, a marginal
+policy's good day beats a robust policy's typical one, and MAP-Elites keeps the
+good day. **The survival gate cannot prevent this** — a lucky policy really did
+survive the one rollout it was gated on. Gating on a single sample of a chaotic
+predicate filters nothing in the long run; it just changes which lottery is
+being run.
+
+**The rule.** `--insertion-replicas N` rolls every candidate out N times and
+judges it on all of them:
+
+* **survival is unanimous** — a candidate counts as a survivor only if it stayed
+  upright in *every* replica. A policy that falls one time in N is a policy that
+  falls;
+* **fitness is the median** displacement — not the max, which is precisely the
+  luck-ranking being removed, and not the mean, which one catastrophic replica
+  drags around;
+* every replica's transitions still go to the replay buffer, so the critic sees
+  N times the data rather than less.
+
+`N=1` is passed through untouched, so the two runs differ in exactly one rule
+and stay comparable; a test pins that.
+
+**The cost is half the search.** N replicas is exactly N times the evaluations,
+so a budget-matched run divides its iterations by N: **99 iterations instead of
+200**, 1024 offspring each, 207,048 evaluations either way. That is not a
+footnote — it is the trade. Half as many genomes are tried, and each result is
+worth believing. Whether the archive that comes out is better is an empirical
+question, answered in the comparison below rather than assumed.
+
+**Its limitation, stated plainly.** Two replicas is a much weaker filter than
+the eight the verification uses. A policy that survives 2 of 2 has a survival
+rate whose 95% interval still stretches down to about 0.22; only about 3 in 4
+genuinely-90%-robust policies pass it on any given attempt. So the re-evaluated
+run is *not* expected to produce an archive that is 100% verified — it is
+expected to shift the distribution, and the honest test is the same 8-replica
+verification applied to both runs. Pushing N higher trades search harder still:
+at N=8 the run would get 25 iterations.
+
+
+### Results — v1 vs v2, all on medians
+
+> **Read this first, or the table below will mislead you.** On this simulator a
+> walking policy's displacement has a **standard deviation of 0.605 m** across
+> byte-identical worlds, and MAP-Elites inserts on one sample and keeps the
+> maximum — so an *archived* value estimates an elite's best luck, by a measured
+> **+0.64 to +0.94 m**. Every "verified" number below is instead the **median of
+> 8 fresh rollouts** per elite, and an elite counts as surviving only if it
+> stayed upright in at least 7 of those 8. Archived values appear only in the
+> row labelled as such.
+
+Three runs, all at ~207,000 evaluations on one RTX 3060:
+
+| | v1 MAP-Elites (CPG) | v1 PGA-ME (MLP) | v2 single-sample | v2 re-evaluated |
+| --- | --- | --- | --- | --- |
+| **what it is** | open-loop CPG, fall penalty | closed-loop MLP, fall penalty | gated + seeded, 200 it | gated + seeded, **99 it x 2 replicas** |
+| **VERIFIED — 8 fresh rollouts per elite** | | | | |
+| elites surviving >= 7 of 8 | **0** | **0** | 4 | **5** |
+| best verified median displacement | — | — | +1.620 m | **+2.117 m** |
+| cells with a verified elite >= 0.25 m | 0 | 0 | 4 | **5** |
+| **STRUCTURE — raw, counts nothing about robustness** | | | | |
+| elites | 340 | 292 | 81 | 62 |
+| raw coverage | 85.0% | 73.0% | 20.2% | 15.5% |
+| *archived best (optimistic)* | *+0.153 m* | *+0.504 m* | *+2.970 m* | *+3.554 m* |
+| *archive optimism* | *-0.217 m* | *-0.064 m* | *+0.643 m* | *+0.897 m* |
+
+**v1's archives contain no robust walkers at all.** Not one of 632 elites across
+both v1 archives survives 7 of 8 fresh rollouts under honest physics. v1's raw
+coverage of 85% and 73% is a map of the ways this robot can fall over.
+
+**v2 produces walkers that travel two metres and keep their feet.** Against
+j002's headline — "the single policy that stays upright covers 8.8 cm" — the
+best verified v2 elite covers **+2.117 m**, about 24x further, and does it in
+five of eight independent rollouts.
+
+#### Verification strictness, reported whole
+
+A single pass/fail threshold hides the distribution, and choosing one after
+seeing the numbers is how a report flatters itself. So here is the whole sweep,
+the same for both v2 archives:
+
+| survives at least | v2 single-sample | | | v2 re-evaluated | | |
+| --- | --- | --- | --- | --- | --- | --- |
+| | elites | cells >=0.25 m | cells >=0.50 m | elites | cells >=0.25 m | cells >=0.50 m |
+| 4 of 8 | 23 | 13 | 11 | 23 | **20** | **19** |
+| 5 of 8 | 16 | 11 | 9 | 17 | **17** | **16** |
+| 6 of 8 | 7 | 7 | 5 | 10 | **10** | **10** |
+| 7 of 8 | 4 | 4 | 2 | 5 | **5** | **5** |
+| 8 of 8 | 3 | 3 | 1 | 3 | 3 | **3** |
+
+Two things to read off it. First, **the re-evaluated run dominates at every
+threshold** on cells above a distance, and its best verified elite goes +2.117 m
+against +1.620 m. Second, and more telling: in the re-evaluated archive the
+"elites" and "cells >= 0.50 m" columns are *the same number* at every strictness
+level. It has no weak survivors. The single-sample archive's do not match at any
+level — a third to a half of what survives there goes nowhere.
+
+**The verification is itself a sample.** Running the same 8-replica check twice
+on the same archives gave 7 and 8 verified elites the first time and 4 and 5 the
+second. That is not a bug; it is the same chaos, one level up. Treat every count
+in these tables as carrying an uncertainty of a few elites, and treat the
+*ordering* between the two runs — which held in both passes — as the result.
+
+#### The cost of the fix, stated as a trade
+
+The re-evaluated run bought its reliability with **half the search**: 99
+iterations instead of 200, at 1024 offspring each, for the same 207,048
+evaluations. It ended with 62 elites against 81 and 15.5% raw coverage against
+20.2%. Fewer genomes tried, each worth believing. On the verified columns —
+the only ones that mean anything here — it wins outright.
+
+#### Where the honest numbers leave the acceptance criteria
+
+Two of this job's criteria are met and two are not, and the failures share one
+cause:
+
+* **PASS** — best replay-verified elite >= 0.5 m in 7 s, and >= 5x j002's best
+  survivor (0.088 m). Measured: **+2.117 m**, 24x.
+* **PASS** — physics honest, no clip below the floor, seeds replay-verified at
+  iteration 0, both GA and PG contributing (re-evaluated run: GA 0.54% and PG
+  0.32% mean insertion, GA 34.0% and PG 31.5% mean feasibility — the same ~2:1
+  GA:PG ratio v1 reported at 3.7%/1.8%).
+* **FAIL** — ">= 90% of 64 sampled elites survive on independent replay."
+  Measured: 8% at 7-of-8, 37% at 4-of-8. The archive is 100% survivors *by
+  construction* and a minority of them in fact.
+* **FAIL** — ">= 20 distinct cells hold elites >= 0.25 m" on verified medians.
+  Measured: 5 at 7-of-8, and exactly 20 at 4-of-8 — so it passes only at the
+  loosest reading of "survives", which is not the reading worth having.
+
+Both failures are the same problem at different depths: **two insertion replicas
+is a much weaker filter than eight-replica verification.** A policy that survives
+2 of 2 still has a 95% interval on its true survival rate reaching down to ~0.22.
+The fix worked in the direction and roughly the magnitude predicted before it
+was run — measured on the same verification pass, mean survival rate per elite
+**0.296 -> 0.395** and elites that never survive a single replay **17 -> 5** —
+and it did not reach 90%, which at matched budget would need something like
+N=8 and 25 iterations. That is a different experiment, and Alex's call rather
+than this job's.
+
+### Budget and reproduction
+
+Budget-matched to v1's 207,048 evaluations:
+
+```bash
+# 1. distil the seed (once, ~4 min)
+uv run python -m qd.seed \
+    --checkpoint logs/rsl_rl/qd_phase1_baseline/<run>/model_399.pt \
+    --out logs/qd/seeds/ppo_seed.npz
+
+# 2a. the single-sample run: 1025 (seed block) + 1024 (random init)
+#     + 200*1025 = 207,049 evaluations
+uv run python -m qd.pga.run_pga_me --iterations 200 --batch-size 1024 \
+    --initial-solutions 1024 --seed-genome logs/qd/seeds/ppo_seeds.npz \
+    --seeding.jitter-count 240 --td3.replay-buffer-size 2000000 \
+    --out-dir logs/qd/pga_me_v2
+
+# 2b. the same budget spent on re-evaluation instead of iterations:
+#     99 iterations x 2 replicas = 207,048 evaluations
+uv run python -m qd.pga.run_pga_me --iterations 99 --batch-size 1024 \
+    --initial-solutions 1024 --seed-genome logs/qd/seeds/ppo_seeds.npz \
+    --seeding.jitter-count 240 --insertion-replicas 2 \
+    --td3.replay-buffer-size 2000000 --out-dir logs/qd/pga_me_v2_reeval
+
+# 3. the honest numbers: every elite re-rolled 8 times, survivors kept
+uv run python -m qd.verify_archive --archive logs/qd/pga_me_v2/archive_final.npz
+uv run python -m qd.verify_archive --archive logs/qd/pga_me_v2_reeval/archive_final.npz
+```
+
+The seed block is one rollout holding the seed, 100 jittered variants
+(`jitter_sigma` 0.02, 4x the GA's iso term so the variants do not all land in
+the seed's own cell) and 924 random MLPs. Together with `--initial-solutions
+1024` that is 1948 random initialisations against v1's 2048 — the random-init
+budget is essentially preserved, with 101 seeded genomes added.
+
+Random MLPs are still evaluated with a seed present. Under the gate almost none
+of them are inserted, but they are precisely the falling-over experience the
+critic needs in its buffer to learn what not to do.
+
+
 ## Watching the gaits
 
 ```bash
 # render every filled cell to mp4 (needs the MUJOCO_GL prefix — see below)
 MUJOCO_GL=glfw uv run python -m qd.render_gaits \
-    --archive logs/qd/map_elites/archive_final.npz --out logs/qd/gaits/cpg
-MUJOCO_GL=glfw uv run python -m qd.render_gaits \
-    --archive logs/qd/pga_me_matched/archive_final.npz --out logs/qd/gaits/pga
+    --archive logs/qd/pga_me_v2/archive_final.npz --out logs/qd/gaits/v2
 
-# build the clickable page
+# the two v1 archives, rendered under v1 physics so the clips match the
+# numbers that archive was searched under (`--no-full-collision`
+# `--no-trim-at-fall` reproduces exactly what v1 published)
+MUJOCO_GL=glfw uv run python -m qd.render_gaits \
+    --archive logs/qd/map_elites/archive_final.npz --out logs/qd/gaits/cpg \
+    --no-full-collision --no-trim-at-fall
+MUJOCO_GL=glfw uv run python -m qd.render_gaits \
+    --archive logs/qd/pga_me_matched/archive_final.npz --out logs/qd/gaits/pga \
+    --no-full-collision --no-trim-at-fall
+
+# build the clickable page: three archives, one switcher
 uv run python -m qd.build_viewer \
-    --manifests logs/qd/gaits/cpg/manifest.json logs/qd/gaits/pga/manifest.json \
-    --labels "MAP-Elites" "PGA-ME" --out logs/qd/viewer/index.html
+    --manifests logs/qd/gaits/cpg/manifest.json \
+                logs/qd/gaits/pga/manifest.json \
+                logs/qd/gaits/v2/manifest.json \
+    --labels "v1 MAP-Elites (CPG)" "v1 PGA-ME (MLP)" "v2 gated + seeded" \
+    --budget-mb 3.3 --out logs/qd/viewer/index.html
 ```
 
 The page is a 20×20 heatmap you click: pick a cell and that elite's gait plays
 beside its fitness, duty factors, distance, time upright and outcome. Arrow keys
-step to the nearest *filled* cell, since the archive has holes. Two manifests
-give an archive switcher.
+step to the nearest *filled* cell, since the archive has holes. Each manifest
+adds an entry to the archive switcher, and `--budget-mb` is **per archive**, so
+three archives on one page need about a third of the per-archive budget two did.
+
+**v2 clips end at the fall.** `--trim-at-fall` (on by default) cuts each clip on
+the frame that world's fall was detected, so a clip is exactly the trajectory
+that was scored — no frames the fitness, descriptor and replay buffer all
+refused to look at. In a gated v2 archive every elite is a survivor, so nothing
+is trimmed there; it is the *v1* archives, replayed, where the difference shows.
 
 **`MUJOCO_GL` must be set before Python starts** — MuJoCo resolves its GL
 backend at import time, so setting it in code is too late. On this WSL2 box
@@ -478,7 +1184,16 @@ The one survivor sits at cell (18, 19) — both feet on the ground ~95% of the
 episode. Watching it is the fastest way to understand the headline: it is
 standing, with a shuffle.
 
-## Comparing the two archives
+## Comparing archives
+
+`qd.compare_archives` leads with **surviving-elite coverage**, not raw
+coverage, and the distinction is the whole reason a v1 archive and a v2 archive
+can be compared at all. Raw coverage counts every filled cell whatever is in
+it; under v1's fall-penalty objective nearly every cell held a policy that
+falls. Surviving-elite coverage counts only cells whose elite is a
+replay-verified full-episode survivor — the same question asked of both
+pipelines: *how much of the behaviour space can this robot reach without
+falling over.* Raw coverage is still printed underneath.
 
 ```bash
 uv run python -m qd.compare_archives \
@@ -495,6 +1210,28 @@ runs used, or the QD-scores are not comparable.
 
 ## Later upgrades (not built)
 
+* ~~Re-evaluation on insertion.~~ **Built** — `--insertion-replicas`, see
+  [above](#the-gate-is-necessary-and-not-sufficient-re-evaluation-on-insertion).
+  What remains open is the *shape* of it: this implementation spends N rollouts
+  on every candidate, including the ones that fall in the first replica and can
+  never pass. A sequential rule — one rollout, and only survivors earn a second
+  — would buy most of the filtering at a fraction of the cost, and on a run
+  where two thirds of offspring fall immediately that is a large fraction.
+  Higher N, or a per-cell running mean that accumulates evidence across an
+  elite's whole lineage, are the other directions.
+* **A descriptor this robot can actually move in.** Per-foot duty factor is
+  nearly invariant across everything the robot can do without falling: six
+  teacher commands spanning a 0.41 m to 2.42 m stride all distil to duty
+  factors within 0.03 of each other, and 256 identical replicas of one genome
+  spread only 0.014. Stride length, lateral drift, energy or a turning rate
+  would all vary more, and a QD archive is only as interesting as the axes it
+  is binned on.
+* **A descriptor-aware PG operator.** PG variation currently ascends Q, which
+  knows nothing about the behaviour descriptor, so it improves elites in place
+  instead of moving them to new cells. A critic conditioned on a target
+  descriptor would make the gradient half of PGA-ME an *exploration* operator
+  rather than a refinement one — which is exactly what a survival-gated search
+  over a thin feasible manifold needs.
 * **CMA-ME** — swap the `GaussianEmitter` for pyribs'
   `EvolutionStrategyEmitter`, which adapts a covariance matrix per emitter and
   usually beats isotropic mutation badly on a 31-D search space. Deliberately

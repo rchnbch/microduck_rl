@@ -90,10 +90,22 @@ def pg_variation(
 
 
 def sample_parents(
-    archive, count: int, generator: torch.Generator, device: str
+    archive,
+    count: int,
+    generator: torch.Generator,
+    device: str,
+    spec: PolicySpec = DEFAULT_SPEC,
 ) -> torch.Tensor:
-    """``count`` elite genomes drawn uniformly with replacement, as a tensor."""
+    """``count`` elite genomes drawn uniformly with replacement, as a tensor.
+
+    An **empty** archive returns fresh random MLPs instead of raising. Under
+    walking-v2's survival gate an archive can legitimately be empty for a
+    while — nothing has stayed upright yet — and the search should keep
+    sampling the space rather than crash on iteration 1.
+    """
     solutions = archive.data("solution")
+    if len(solutions) == 0:
+        return spec.initial_population(count, generator, device)
     idx = torch.randint(
         len(solutions), (count,), device=device, generator=generator
     )

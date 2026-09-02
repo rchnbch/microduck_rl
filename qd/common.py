@@ -100,10 +100,24 @@ class RolloutMetrics:
     would keep accruing both objective and descriptor.
     """
 
-    def __init__(self, num_envs: int, cfg: FitnessCfg, device: str | torch.device):
+    def __init__(
+        self,
+        num_envs: int,
+        cfg: FitnessCfg,
+        device: str | torch.device,
+        episode_steps: int | None = None,
+    ):
         self.cfg = cfg
         self.num_envs = num_envs
         self.device = device
+        self.episode_steps = episode_steps
+        """Denominator for the fallen fraction, when the loop may stop early.
+
+        Walking-v2 breaks out of the rollout as soon as every world has fallen
+        (there is nothing left to simulate, and post-fall physics must not
+        reach any metric). ``total_steps`` would then be the *truncated* length
+        and every env would read as 100% alive. Pinning the denominator to the
+        full episode keeps the fraction meaning what it says."""
         z = lambda dtype: torch.zeros(num_envs, dtype=dtype, device=device)
         self.start_x = z(torch.float32)
         self.frozen_x = z(torch.float32)
@@ -165,7 +179,7 @@ class RolloutMetrics:
         cfg = self.cfg
         displacement = self.frozen_x - self.start_x
 
-        total = max(self.total_steps, 1)
+        total = max(self.episode_steps or self.total_steps, 1)
         fallen_fraction = 1.0 - self.alive_steps.float() / total
         fitness = displacement - cfg.fall_penalty * fallen_fraction
         fitness = torch.nan_to_num(fitness, nan=cfg.min_fitness).clamp_min(cfg.min_fitness)

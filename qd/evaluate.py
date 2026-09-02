@@ -57,21 +57,62 @@ class HarnessCfg:
     command_lag: int = FIXED_COMMAND_LAG
     vin: float = NOMINAL_VIN
 
+    full_collision: bool = True
+    """Walking-v2 default: ``robot_allcollisions.xml`` instead of ``robot_walk.xml``.
+
+    ``robot_walk.xml`` gives ground-collision geoms to the two foot soles only —
+    trunk, head, hips and thighs are ``contype=0`` or self-collision-only. That
+    is sound for PPO, which *terminates* the episode at the fall, and dishonest
+    for a QD rollout, which keeps simulating: a toppled robot sinks through the
+    floor and the rendered clip shows a duck buried in the plane. The
+    all-collisions model gives every shell a ground contact, so a fall lands on
+    the floor like a fall. Phase 2/v1 ran with this ``False``; see the v1-vs-v2
+    section of the README for the measured cost."""
+
+    fall_check_every: int = 25
+    """Control steps between "has every world fallen yet?" checks (0.5 s).
+
+    The rollout stops when nothing is upright any more. Not checked every step:
+    ``alive.any()`` forces a host sync."""
+
+    njmax: int = 128
+    """Constraints allocated per world.
+
+    mjlab's heuristic is sized for the foot-only model and overflows once every
+    shell can touch the ground: a robot lying on its side under
+    ``full_collision`` produced ``nefc overflow - please increase njmax to 91``
+    from ``qd.check_harness``, and an overflow silently *drops* constraints —
+    i.e. quietly makes the floor soft again, which is the exact bug
+    ``full_collision`` exists to fix. 128 clears the worst observed frame with
+    headroom. (The Phase-3 harness runs through ``ManagerBasedRlEnv``, which
+    sizes this itself and never overflowed; this is the low-level path.)"""
+
     @property
     def control_dt(self) -> float:
         return self.physics_dt * self.decimation
 
 
 def _deterministic_robot_cfg(harness_cfg: HarnessCfg):
-    """``MICRODUCK_WALK_ROBOT_CFG`` with every actuator DR knob pinned.
+    """The repo's robot cfg with every actuator DR knob pinned.
 
     Built with :func:`dataclasses.replace` on the repo's own actuator config so
     the BAM motor model, firmware gain and friction stay in sync with training
     automatically; only the randomization ranges are overridden.
-    """
-    from mjlab_microduck.robot.microduck_constants import MICRODUCK_WALK_ROBOT_CFG
 
-    cfg = MICRODUCK_WALK_ROBOT_CFG
+    ``full_collision`` picks the model: ``MICRODUCK_STANDUP_ROBOT_CFG`` is the
+    same robot on ``robot_allcollisions.xml`` (identical HOME frame, identical
+    actuators, identical ``FULL_COLLISION`` cfg) — only the MJCF differs.
+    """
+    from mjlab_microduck.robot.microduck_constants import (
+        MICRODUCK_STANDUP_ROBOT_CFG,
+        MICRODUCK_WALK_ROBOT_CFG,
+    )
+
+    cfg = (
+        MICRODUCK_STANDUP_ROBOT_CFG
+        if harness_cfg.full_collision
+        else MICRODUCK_WALK_ROBOT_CFG
+    )
     assert cfg.articulation is not None
     actuators = tuple(
         dataclasses.replace(
@@ -134,7 +175,9 @@ class MicroduckRolloutHarness:
         self.scene = Scene(scene_cfg, device=cfg.device)
         self.sim = Simulation(
             num_envs=cfg.num_envs,
-            cfg=SimulationCfg(mujoco=MujocoCfg(timestep=cfg.physics_dt)),
+            cfg=SimulationCfg(
+                mujoco=MujocoCfg(timestep=cfg.physics_dt), njmax=cfg.njmax
+            ),
             model=self.scene.compile(),
             device=cfg.device,
         )
@@ -240,9 +283,14 @@ class MicroduckRolloutHarness:
 
         ``controller(step, t)`` returns ``(num_envs, 10)`` leg targets for
         control step ``step`` at time ``t`` seconds since the CPG started.
-        ``recorder(phase, step)``, if given, is called after every control step
-        with ``phase`` in ``{"settle", "episode"}`` — used by ``qd/play_elite.py``
-        to log qpos for viewer playback.
+        ``recorder(phase, step, alive)``, if given, is called after every
+        control step with ``phase`` in ``{"settle", "episode"}`` and ``alive``
+        the ``(N,)`` mask of worlds still upright *on that step* (``None``
+        during the settle) — used by ``qd/play_elite.py`` and
+        ``qd/render_gaits.py`` to log qpos, and to cut each clip at its fall.
+
+        The loop stops once no world is upright: post-fall physics reaches no
+        metric, so there is nothing left to simulate.
         """
         fit = self.fitness
         settle_steps = round(fit.settle_seconds / self.control_dt)
@@ -253,18 +301,27 @@ class MicroduckRolloutHarness:
             self.set_leg_targets(self.home_leg_targets)
             self.step()
             if recorder is not None:
-                recorder("settle", k)
+                recorder("settle", k, None)
 
-        metrics = RolloutMetrics(self.num_envs, fit, self.device)
+        metrics = RolloutMetrics(self.num_envs, fit, self.device, episode_steps)
         metrics.begin(self.base_pos())
+        alive = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         for k in range(episode_steps):
             self.set_leg_targets(controller(k, k * self.control_dt))
             self.step()
+            was_alive = alive.clone()
             metrics.update(
                 self.base_pos(), self.projected_gravity(), self.foot_contact()
             )
+            alive = ~metrics.fallen
             if recorder is not None:
-                recorder("episode", k)
+                recorder("episode", k, was_alive)
+            if (
+                self.cfg.fall_check_every
+                and (k + 1) % self.cfg.fall_check_every == 0
+                and not bool(alive.any())
+            ):
+                break
         return metrics.finalize()
 
     def close(self) -> None:

@@ -54,10 +54,11 @@ class Args:
     camera_lookat_z: float = 0.09
     """Fixed height for the camera target.
 
-    The camera follows the trunk in x/y but NOT in z: ``robot_walk.xml`` has no
-    trunk collision geom, so after a face-plant the trunk frame ends up ~0.1 m
-    *below* the floor and a z-tracking camera would dive underground with it,
-    shrinking the robot to a speck exactly when you want to see what happened.
+    The camera follows the trunk in x/y but NOT in z. Under v1's foot-only
+    collision model the trunk frame ended up ~0.1 m *below* the floor after a
+    face-plant and a z-tracking camera dived underground with it; walking-v2's
+    full-collision model keeps the trunk above the plane, but a fixed target
+    height still frames a fall better than one that follows a bouncing trunk.
     """
 
     max_envs: int = 128
@@ -66,6 +67,17 @@ class Args:
     device: str = "cuda:0"
     genome: str = "auto"
     """'cpg', 'mlp', or 'auto' (inferred from the solution width)."""
+
+    full_collision: bool = True
+    """Render under walking-v2 physics (every shell collides with the ground).
+
+    Set ``False`` only to reproduce a v1 clip under v1 physics."""
+
+    trim_at_fall: bool = True
+    """Cut each clip on the frame that world's fall was detected.
+
+    The clip is then exactly the trajectory that was scored — no frames the
+    fitness, descriptor and replay buffer all refused to look at."""
 
     fitness: FitnessCfg = field(default_factory=FitnessCfg)
 
@@ -76,45 +88,65 @@ def _select(data: dict, top: int) -> np.ndarray:
 
 
 def _rollout_with_qpos(args: Args, batch: np.ndarray, kind: str):
-    """Roll a batch out and return ``(qpos (T, N, nq), fitness, measures, info, mj_model)``."""
+    """Roll a batch out and return ``(qpos, alive, fitness, measures, info, mj_model)``.
+
+    ``qpos`` is ``(T, N, nq)`` and ``alive`` the matching ``(T, N)`` mask of
+    which worlds were still upright on each frame. Walking-v2 cuts each clip at
+    its own fall: a clip is the trajectory that was *scored*, and the scored
+    trajectory ends at the fall.
+    """
     import torch
 
     frames: list[np.ndarray] = []
+    alive_frames: list[np.ndarray] = []
+
+    def make_recorder(sim):
+        def recorder(_phase, _step, alive):
+            frames.append(sim.data.qpos.detach().cpu().numpy().copy())
+            alive_frames.append(
+                np.ones(len(batch), dtype=bool)
+                if alive is None
+                else alive.detach().cpu().numpy().copy()
+            )
+
+        return recorder
 
     if kind == "cpg":
         from qd.evaluate import CpgEvaluator, HarnessCfg, MicroduckRolloutHarness
 
         harness = MicroduckRolloutHarness(
-            HarnessCfg(num_envs=len(batch), device=args.device), args.fitness
+            HarnessCfg(
+                num_envs=len(batch),
+                device=args.device,
+                full_collision=args.full_collision,
+            ),
+            args.fitness,
         )
         sim = harness.sim
-
-        def recorder(_phase, _step):
-            frames.append(sim.data.qpos.detach().cpu().numpy().copy())
-
         evaluator = CpgEvaluator(harness)
         fitness, measures, info = evaluator._evaluate_chunk(
-            evaluator.space.clip(batch), recorder=recorder
+            evaluator.space.clip(batch), recorder=make_recorder(sim)
         )
         mj_model = sim.mj_model
     else:
         from qd.pga.evaluate import PolicyHarnessCfg, PolicyRolloutHarness
 
         harness = PolicyRolloutHarness(
-            PolicyHarnessCfg(num_envs=len(batch), device=args.device), args.fitness
+            PolicyHarnessCfg(
+                num_envs=len(batch),
+                device=args.device,
+                full_collision=args.full_collision,
+            ),
+            args.fitness,
         )
         sim = harness.env.sim
-
-        def recorder(_phase, _step):
-            frames.append(sim.data.qpos.detach().cpu().numpy().copy())
-
         genomes = torch.as_tensor(batch, dtype=torch.float32, device=args.device)
         fitness, measures, info, _ = harness.rollout(
-            genomes, collect=False, recorder=recorder
+            genomes, collect=False, recorder=make_recorder(sim)
         )
         mj_model = sim.mj_model
 
-    return np.stack(frames), fitness, measures, info, mj_model
+    return np.stack(frames), np.stack(alive_frames), fitness, measures, info, mj_model
 
 
 def _render_clip(
@@ -175,7 +207,9 @@ def main(args: Args | None = None) -> None:
     for start in range(0, len(rows), args.max_envs):
         chunk = rows[start : start + args.max_envs]
         batch = data["solution"][chunk]
-        qpos, fitness, measures, info, mj_model = _rollout_with_qpos(args, batch, kind)
+        qpos, alive, fitness, measures, info, mj_model = _rollout_with_qpos(
+            args, batch, kind
+        )
         trunk_body = mujoco.mj_name2id(
             mj_model, mujoco.mjtObj.mjOBJ_BODY, "robot/trunk_base"
         )
@@ -186,7 +220,10 @@ def main(args: Args | None = None) -> None:
             cell = np.unravel_index(int(data["index"][row]), dims)
             name = f"cell_r{int(cell[0]):02d}_c{int(cell[1]):02d}"
             path = clips_dir / f"{name}.mp4"
-            pixels = _render_clip(mj_model, qpos[:, i, :], args, trunk_body)
+            frames = qpos[:, i, :]
+            if args.trim_at_fall:
+                frames = frames[: int(alive[:, i].sum())]
+            pixels = _render_clip(mj_model, frames, args, trunk_body)
             imageio.mimwrite(
                 path, pixels, fps=fps, quality=args.quality, macro_block_size=1
             )

@@ -127,7 +127,7 @@ def main(args: Args | None = None) -> None:
     contact_log: list[np.ndarray] = []
     base_log: list[np.ndarray] = []
 
-    def recorder(phase: str, _step: int) -> None:
+    def recorder(phase: str, _step: int, _alive=None) -> None:
         qpos_log.append(harness.sim.data.qpos[0].detach().cpu().numpy().copy())
         contact_log.append(harness.foot_contact()[0].detach().cpu().numpy().copy())
         base_log.append(harness.base_pos()[0].detach().cpu().numpy().copy())

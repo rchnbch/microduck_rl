@@ -122,6 +122,7 @@ def _load(manifest_path: Path, label: str, budget_bytes: float, top: int) -> dic
         # Absent on a v1/v2 manifest; the page falls back to duty factor, which
         # is what those archives were binned on.
         "descriptor": manifest.get("descriptor"),
+        "verified": bool(manifest.get("verified", False)),
         "fps": manifest["fps"],
         "episodeSeconds": manifest["episode_seconds"],
         "elites": out_entries,
@@ -317,7 +318,7 @@ footer p { margin: 0 0 8px; }
   <div class="panel">
     <section class="card">
       <h2>Behaviour archive</h2>
-      <p class="hint">Colour is fitness: forward metres, minus a penalty for time spent fallen.
+      <p class="hint" id="gridHint">Colour is fitness: forward metres, minus a penalty for time spent fallen.
         Click a cell, or focus the grid and use the arrow keys.</p>
       <div class="grid-frame">
         <div class="ylab" id="ylab">Right foot duty factor →</div>
@@ -397,6 +398,9 @@ function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 function fmt(v) { return Math.abs(v) >= 0.1 ? v.toFixed(2) : v.toPrecision(3); }
 
 function renderAxes(a) {
+  document.getElementById("gridHint").textContent = a.verified
+    ? "Colour is the elite's median forward distance over 8 fresh rollouts. The clip beside it is one of those rollouts, and this simulator's chaos means a single one can differ from the median by half a metre. Click a cell, or focus the grid and use the arrow keys."
+    : "Colour is fitness: forward metres, minus a penalty for time spent fallen. Click a cell, or focus the grid and use the arrow keys.";
   const d = descOf(a);
   document.getElementById("xlab").textContent = cap(d.labels[0]) + " →";
   document.getElementById("ylab").textContent = cap(d.labels[1]) + " →";
@@ -477,8 +481,9 @@ function select(e) {
 
   const ok = e.survived ? 1 : 0;
   document.getElementById("readout").innerHTML = `
-    <div><dt>Archived fitness</dt><dd>${f3(e.archived_fitness)} m</dd></div>
-    <div><dt>Replay fitness</dt><dd>${f3(e.replay_fitness)} m</dd></div>
+    <div><dt>${DATA[current].verified ? "Verified median (8 rollouts)" : "Archived fitness"}</dt>
+        <dd>${f3(e.archived_fitness)} m</dd></div>
+    <div><dt>This rollout</dt><dd>${f3(e.replay_fitness)} m</dd></div>
     <div><dt>Distance travelled</dt><dd>${f3(e.displacement_m)} m</dd></div>
     <div><dt>Time upright</dt><dd>${e.upright_s.toFixed(2)} s</dd></div>
     <div><dt>${cap(d.labels[0])}</dt><dd>${fmt(mx(e))}</dd></div>

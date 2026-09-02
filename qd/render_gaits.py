@@ -266,6 +266,12 @@ def main(args: Args | None = None) -> None:
         "archive": str(args.archive),
         "genome": kind,
         "grid_dims": list(dims),
+        # True when the archive came out of `qd.verify_archive`, i.e. its
+        # objective column is a median over fresh replicas rather than the one
+        # lucky sample the search inserted on. The viewer labels it accordingly:
+        # calling a verified median "archived fitness" would hide the whole
+        # point of verifying.
+        "verified": bool((data.get("meta") or {}).get("verified", False)),
         "descriptor": {
             "axes": list(descriptor.names),
             "labels": list(descriptor.labels),

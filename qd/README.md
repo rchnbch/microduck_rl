@@ -528,7 +528,23 @@ MUJOCO_GL=glfw uv run python -m qd.check_floor --num-envs 64 \
     --dump-frames logs/qd/floor_frames --out logs/qd/floor_check.json
 ```
 
-**What it costs: nothing.** `qd.bench_collision` at batch 1024 on an RTX 3060,
+**One thing full collision does cost: constraint budget.** More geoms touching
+the ground means more constraints, and mjlab's default allocation is sized for
+the foot-only model. Under `full_collision`, `qd.check_harness` printed
+`nefc overflow - please increase njmax to 91` on a robot lying on its side. An
+nefc overflow silently *drops* constraints — it quietly makes the floor soft
+again, which is exactly the bug `full_collision` exists to fix, reappearing on
+the frames where honest physics matters most. `HarnessCfg.njmax` is pinned to
+128. Only the low-level Phase-2 path was affected; the Phase-3
+`ManagerBasedRlEnv` path sizes this itself and logged zero overflows across
+both full runs.
+
+The measured constants survive the model swap, which is the check AGENTS.md
+insists on: settled trunk z **0.1151 m** under all-collisions against v1's
+0.115 m, 40 mm of margin over the 0.075 m fall threshold, and a passive HOME
+hold still toppling at **1.34 s**.
+
+**What it costs in time: nothing.** `qd.bench_collision` at batch 1024 on an RTX 3060,
 identical population in all four rows:
 
 | collision | stops at fall | s/generation | ms/genome |

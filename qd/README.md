@@ -29,6 +29,7 @@ qd/
 ├── check_harness.py   physics sanity checks — run before any long run
 ├── check_floor.py     v2: is any part of the robot under the plane?
 ├── check_repeatability.py  v2: how much is one evaluation worth? (not much)
+├── verify_archive.py  v2: re-roll every elite N times; keep the ones that are real
 ├── bench.py           throughput + evaluation-noise benchmark: pick a batch size
 ├── bench_collision.py v2: what full-body ground collision costs
 ├── survival_report.py   re-evaluate elites: survival + archive optimism
@@ -919,6 +920,66 @@ Combined with the flatness finding above, the picture is that this robot's
 behaviour space, as this descriptor sees it, is both narrow and stubborn: hard
 to move deliberately, and barely moved by chance.
 
+### The gate is necessary and not sufficient: re-evaluation on insertion
+
+The 200-iteration survival-gated run met the physics, wiring and locomotion
+criteria and failed the two honesty ones. Of 64 elites sampled uniformly from
+the archive and replayed 8 times each, **14 survived**. Verifying all 81 elites
+the same way left **7** that survive at least 7 of 8 replicas, holding **6**
+cells above 0.25 m.
+
+An archive that is 100% survivors by construction was 91% coin-flips in fact.
+
+**The proof of what went wrong is the seeds.** Six genomes went into the archive
+at iteration 0 with 99-100% measured replica survival, the most robust policies
+in the whole run by a wide margin. At iteration 200, **not one of them is in the
+archive**:
+
+```
+seed 0 (vx 0.10): evicted    seed 3 (vx 0.40): evicted
+seed 1 (vx 0.20): evicted    seed 4 (fwd+strafe): evicted
+seed 2 (vx 0.30): evicted    seed 5 (fwd+turn): evicted
+```
+
+Each was replaced, in its own cell, by a descendant that got a luckier single
+rollout. With displacement carrying a 0.605 m standard deviation, a marginal
+policy's good day beats a robust policy's typical one, and MAP-Elites keeps the
+good day. **The survival gate cannot prevent this** — a lucky policy really did
+survive the one rollout it was gated on. Gating on a single sample of a chaotic
+predicate filters nothing in the long run; it just changes which lottery is
+being run.
+
+**The rule.** `--insertion-replicas N` rolls every candidate out N times and
+judges it on all of them:
+
+* **survival is unanimous** — a candidate counts as a survivor only if it stayed
+  upright in *every* replica. A policy that falls one time in N is a policy that
+  falls;
+* **fitness is the median** displacement — not the max, which is precisely the
+  luck-ranking being removed, and not the mean, which one catastrophic replica
+  drags around;
+* every replica's transitions still go to the replay buffer, so the critic sees
+  N times the data rather than less.
+
+`N=1` is passed through untouched, so the two runs differ in exactly one rule
+and stay comparable; a test pins that.
+
+**The cost is half the search.** N replicas is exactly N times the evaluations,
+so a budget-matched run divides its iterations by N: **99 iterations instead of
+200**, 1024 offspring each, 207,048 evaluations either way. That is not a
+footnote — it is the trade. Half as many genomes are tried, and each result is
+worth believing. Whether the archive that comes out is better is an empirical
+question, answered in the comparison below rather than assumed.
+
+**Its limitation, stated plainly.** Two replicas is a much weaker filter than
+the eight the verification uses. A policy that survives 2 of 2 has a survival
+rate whose 95% interval still stretches down to about 0.22; only about 3 in 4
+genuinely-90%-robust policies pass it on any given attempt. So the re-evaluated
+run is *not* expected to produce an archive that is 100% verified — it is
+expected to shift the distribution, and the honest test is the same 8-replica
+verification applied to both runs. Pushing N higher trades search harder still:
+at N=8 the run would get 25 iterations.
+
 ### Budget and reproduction
 
 Budget-matched to v1's 207,048 evaluations:
@@ -929,10 +990,23 @@ uv run python -m qd.seed \
     --checkpoint logs/rsl_rl/qd_phase1_baseline/<run>/model_399.pt \
     --out logs/qd/seeds/ppo_seed.npz
 
-# 2. the run: 1025 (seed block) + 1024 (random init) + 200*1025 = 207,049 evals
+# 2a. the single-sample run: 1025 (seed block) + 1024 (random init)
+#     + 200*1025 = 207,049 evaluations
 uv run python -m qd.pga.run_pga_me --iterations 200 --batch-size 1024 \
-    --initial-solutions 1024 --seed-genome logs/qd/seeds/ppo_seed.npz \
-    --td3.replay-buffer-size 2000000 --out-dir logs/qd/pga_me_v2
+    --initial-solutions 1024 --seed-genome logs/qd/seeds/ppo_seeds.npz \
+    --seeding.jitter-count 240 --td3.replay-buffer-size 2000000 \
+    --out-dir logs/qd/pga_me_v2
+
+# 2b. the same budget spent on re-evaluation instead of iterations:
+#     99 iterations x 2 replicas = 207,048 evaluations
+uv run python -m qd.pga.run_pga_me --iterations 99 --batch-size 1024 \
+    --initial-solutions 1024 --seed-genome logs/qd/seeds/ppo_seeds.npz \
+    --seeding.jitter-count 240 --insertion-replicas 2 \
+    --td3.replay-buffer-size 2000000 --out-dir logs/qd/pga_me_v2_reeval
+
+# 3. the honest numbers: every elite re-rolled 8 times, survivors kept
+uv run python -m qd.verify_archive --archive logs/qd/pga_me_v2/archive_final.npz
+uv run python -m qd.verify_archive --archive logs/qd/pga_me_v2_reeval/archive_final.npz
 ```
 
 The seed block is one rollout holding the seed, 100 jittered variants
@@ -1036,16 +1110,15 @@ runs used, or the QD-scores are not comparable.
 
 ## Later upgrades (not built)
 
-* **Re-evaluation on insertion.** The single most valuable thing not built
-  here, and the measurement that says so is
-  [above](#the-finding-that-reframes-every-number-here-a-walkers-fitness-is-chaotic):
-  one rollout of a walker has a 0.6 m standard deviation in displacement, and
-  MAP-Elites inserts on one sample and keeps the maximum, so archived values
-  rank luck as much as ability (+0.60 m of it, measured). Re-evaluating a
-  candidate before insertion, or keeping a running mean per cell, fixes it at
-  the cost of a second evaluation per candidate — half the archive at the same
-  budget. Whether that trade is worth it is itself an experiment worth running,
-  and it is the one to run next.
+* ~~Re-evaluation on insertion.~~ **Built** — `--insertion-replicas`, see
+  [above](#the-gate-is-necessary-and-not-sufficient-re-evaluation-on-insertion).
+  What remains open is the *shape* of it: this implementation spends N rollouts
+  on every candidate, including the ones that fall in the first replica and can
+  never pass. A sequential rule — one rollout, and only survivors earn a second
+  — would buy most of the filtering at a fraction of the cost, and on a run
+  where two thirds of offspring fall immediately that is a large fraction.
+  Higher N, or a per-cell running mean that accumulates evidence across an
+  elite's whole lineage, are the other directions.
 * **A descriptor this robot can actually move in.** Per-foot duty factor is
   nearly invariant across everything the robot can do without falling: six
   teacher commands spanning a 0.41 m to 2.42 m stride all distil to duty

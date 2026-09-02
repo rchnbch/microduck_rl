@@ -1484,20 +1484,35 @@ MUJOCO_GL=glfw uv run python -m qd.render_gaits \
     --archive logs/qd/pga_me_matched/archive_final.npz --out logs/qd/gaits/pga \
     --no-full-collision --no-trim-at-fall
 
-# build the clickable page: three archives, one switcher
+# v3: render the VERIFIED archive, so the colour is a median over 8 rollouts
+MUJOCO_GL=glfw uv run python -m qd.render_gaits \
+    --archive logs/qd/pga_me_v3/archive_final_verified.npz --out logs/qd/gaits/v3
+
+# build the clickable page: four archives, one switcher
 uv run python -m qd.build_viewer \
     --manifests logs/qd/gaits/cpg/manifest.json \
                 logs/qd/gaits/pga/manifest.json \
                 logs/qd/gaits/v2/manifest.json \
+                logs/qd/gaits/v3/manifest.json \
     --labels "v1 MAP-Elites (CPG)" "v1 PGA-ME (MLP)" "v2 gated + seeded" \
-    --budget-mb 3.3 --out logs/qd/viewer/index.html
+             "v3 measured axes + independent 8-replica gate" \
+    --budget-mb 2.6 --out logs/qd/viewer/index.html
 ```
 
 The page is a 20×20 heatmap you click: pick a cell and that elite's gait plays
-beside its fitness, duty factors, distance, time upright and outcome. Arrow keys
-step to the nearest *filled* cell, since the archive has holes. Each manifest
-adds an entry to the archive switcher, and `--budget-mb` is **per archive**, so
-three archives on one page need about a third of the per-archive budget two did.
+beside its distance, time upright, outcome and both of **that archive's own**
+behaviour axes — the labels under the grid change with the switcher, because a
+v3 archive is not binned on the same quantities a v1 or v2 archive was. Duty
+factor is still reported for every clip whatever the archive's axes are, so a
+v2 gait and a v3 gait can be compared on it. Arrow keys step to the nearest
+*filled* cell, since the archive has holes. Each manifest adds an entry to the
+archive switcher, and `--budget-mb` is **per archive**, so four archives on one
+page need about a quarter of the per-archive budget one did.
+
+Rendering the **verified** archive rather than the raw one is the honest choice
+for a gated run, and the page says so: the colour is then the elite's median
+over eight fresh rollouts, while the clip beside it is a single one of those
+rollouts, which on this simulator can differ from the median by half a metre.
 
 **v2 clips end at the fall.** `--trim-at-fall` (on by default) cuts each clip on
 the frame that world's fall was detected, so a clip is exactly the trajectory

@@ -54,6 +54,14 @@ class Args:
     qd_score_offset: float = -5.0
     """Must match the runs' offset, or the QD-scores are not comparable."""
 
+    replicas: int = 1
+    """Re-evaluate every elite this many times and take the MEDIAN.
+
+    One rollout of a walking policy has a ~0.6 m standard deviation in
+    displacement on this simulator (`qd.check_repeatability`), so a
+    single-replica comparison between two archives of walkers compares their
+    luck as much as their ability. Costs `replicas` x the evaluations."""
+
     device: str = "cuda:0"
     max_envs: int = 512
     fitness: FitnessCfg = field(default_factory=FitnessCfg)
@@ -87,16 +95,42 @@ def _measure(data: dict, args: Args, label: str) -> dict:
         out["grid"] = _grid(dims, data["index"], archived)
         return out
 
-    print(f"  re-evaluating {len(archived)} elites of {label}...", flush=True)
+    reps = max(1, args.replicas)
+    print(
+        f"  re-evaluating {len(archived)} elites of {label}"
+        + (f" x {reps} replicas" if reps > 1 else "")
+        + "...",
+        flush=True,
+    )
+    # Elite-major tiling, so a reshape recovers the per-elite axis whatever the
+    # chunking did.
     fitness, measures, info, control_dt = reevaluate(
-        data["solution"], out["genome"], args.fitness, args.device, args.max_envs
+        np.repeat(data["solution"], reps, axis=0),
+        out["genome"],
+        args.fitness,
+        args.device,
+        args.max_envs,
     )
     del measures
+    if reps > 1:
+        n = len(archived)
+        fitness = np.median(fitness.reshape(n, reps), axis=1)
+        info = {
+            # An elite counts as fallen unless it survives the majority of its
+            # replicas — survival is a rate, not a sample.
+            "fell": np.mean(info["fell"].reshape(n, reps), axis=1) > 0.5,
+            "displacement": np.median(info["displacement"].reshape(n, reps), axis=1),
+            "alive_steps": np.median(info["alive_steps"].reshape(n, reps), axis=1),
+            "survival_fraction": np.mean(
+                info["survival_fraction"].reshape(n, reps), axis=1
+            ),
+        }
     upright_s = info["alive_steps"] * control_dt
     survived = ~info["fell"]
 
     out.update(
         {
+            "replicas_per_elite": reps,
             # The headline structural number: cells whose elite is a
             # replay-verified survivor. Every elite occupies a distinct cell
             # (that is what an archive is), so this counts cells.

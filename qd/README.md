@@ -1300,6 +1300,131 @@ The generalisable version, for anyone replicating a stochastic evaluation on a
 batched simulator: **re-running the same batch is not the same as resampling.**
 If the batch index is part of the state, replicate across indices.
 
+### Results — v2 vs v3, all on medians
+
+> Same warning as v2's table, and it still governs everything below. On this
+> simulator a walking policy's displacement has a standard deviation of 0.605 m
+> across byte-identical worlds, so every "verified" number here is the **median
+> of 8 fresh rollouts** per elite, produced by a verification pass that is
+> independent of insertion, and an elite counts as surviving only if it stayed
+> upright in at least 7 of those 8.
+>
+> Cell counts are given **resolvable / raw**. Raw counts cells of the 20x20
+> grid. Resolvable re-bins the same elites at the resolution the descriptor's
+> own reproducibility supports — bins `2*sqrt(2)` standard errors of the
+> archived median wide, which on the final archive is a 9x15 grid. **Quote the
+> resolvable number**: a cell count on a grid finer than the measurement is a
+> count of quantization, not of behaviours.
+
+| | v2 single-sample | v2 re-evaluated (N=2) | v3 in-place ablation (it 10) | v3 permuted (it 10) | v3 budget-matched (207k evals) | **v3 full (426k evals)** |
+| --- | --- | --- | --- | --- | --- | --- |
+| **VERIFIED — 8 fresh rollouts per elite** | | | | | | |
+| elites surviving 7-of-8 | 4 | 5 | 193 | 223 | 242 | **268** |
+| archive robustness (7-of-8) | 5% | 8% | 65% | **83%** | 74% | 75% |
+| best verified median displacement | +1.620 m | +2.117 m | +2.099 m | +2.222 m | +2.167 m | **+2.286 m** |
+| cells with a verified elite >= 0.25 m | 4 | 5 | 90 / 186 | 116 / 219 | 110 / 241 | **109 / 263** |
+| cells with a verified elite >= 0.50 m | 2 | 5 | 84 / 170 | 113 / 211 | 110 / 238 | **109 / 261** |
+| mean survival rate per elite | 0.296 | 0.395 | 0.836 | **0.925** | 0.885 | 0.883 |
+| elites that never survived a replay | 17 | 5 | — | — | — | **0** |
+| **STRUCTURE — raw, counts nothing about robustness** | | | | | | |
+| elites | 81 | 62 | 299 | 268 | 327 | 356 |
+| raw coverage | 20.2% | 15.5% | 74.8% | 67.0% | 81.8% | 89.0% |
+| *archive optimism (archived − verified median)* | *+0.643 m* | *+0.887 m* | *+0.516 m* | *+0.159 m* | *+0.209 m* | *+0.261 m* |
+| cell stability (exact / within one) | — | — | 18% / 64% | 35% / 91% | 39% / 88% | 33% / 90% |
+
+**The headline.** Against v2's best archive — 5 robust elites in 5 cells — v3
+holds **268 robust elites in 109 resolvable cells**, and its best verified
+walker covers **+2.286 m** against +2.117 m. The elites that never survive a
+single replay, 17 in v2's single-sample archive and 5 after its N=2 fix, are
+**zero**. At *equal* evaluation budget (the 207k snapshot) the numbers are
+242 elites in 110 cells: the win is not bought with the extra budget.
+
+Both halves contributed and they are separable. The descriptor is why there are
+cells to fill at all — v2's search was not failing to find gaits, it was
+finding them in a space that could not tell them apart. The gate is why the
+ones in the archive are real: archive optimism falls from +0.887 m to +0.26 m,
+and mean per-elite survival from 0.40 to 0.88.
+
+#### Verification strictness, reported whole
+
+The same sweep v2 published, on the final v3 archive (356 raw elites), cells as
+resolvable / raw:
+
+| survives at least | elites | cells >= 0.25 m | cells >= 0.50 m | best median |
+| --- | --- | --- | --- | --- |
+| 4 of 8 | 354 | 114 / 348 | 114 / 343 | +2.286 m |
+| 5 of 8 | 348 | 114 / 342 | 114 / 338 | +2.286 m |
+| 6 of 8 | 332 | 114 / 326 | 114 / 324 | +2.286 m |
+| **7 of 8** | **268** | **109 / 263** | **109 / 261** | **+2.286 m** |
+| 8 of 8 | 146 | 89 / 146 | 88 / 144 | +2.266 m |
+
+The property v2 could only claim at its best threshold — that "elites" and
+"cells above 0.50 m" are nearly the same number — holds here at *every*
+strictness level. There are essentially no weak survivors: an elite that stays
+up in this archive is an elite that travels.
+
+#### What the replication fix bought, measured
+
+Two runs identical in every respect except how the eight insertion replicas
+were drawn, compared at the same iteration (10) and the same evaluation count:
+
+| at iteration 10 | replicas in place (v2's mechanism) | replicas across permuted worlds |
+| --- | --- | --- |
+| archive robustness (7-of-8) | 65% | **83%** |
+| mean survival rate per elite | 0.836 | **0.925** |
+| archive optimism | +0.516 m | **+0.159 m** |
+| cell stability (exact / within one) | 18% / 64% | **35% / 91%** |
+| resolvable cells >= 0.25 m | 90 | **116** |
+| raw elites | 299 | 268 |
+
+The permuted gate admits 31 fewer elites and 18 percentage points more of them
+are real. It also more than halves the archive's optimism and doubles its
+cell stability — which is the second half of the same story: an insertion
+median over eight *correlated* replicas is a worse estimate of the descriptor,
+not only of the fitness, so the geography was fuzzier too.
+
+#### Robustness fell short of the bar, and the reason is measurable
+
+The pre-registered criterion was **>= 90%** of final-archive elites surviving
+7-of-8. Measured: **75%**. Not a pass, and worth being precise about why,
+because the shortfall is structural rather than a tuning miss.
+
+Mean true survival across the archive is **0.883**. For an elite with true
+survival `p`, the chance of clearing a 7-of-8 bar is `8p⁷(1−p) + p⁸`:
+
+| true survival `p` | P(passes 7 of 8) |
+| --- | --- |
+| 0.80 | 0.50 |
+| 0.85 | 0.66 |
+| 0.88 | **0.73** |
+| 0.90 | 0.81 |
+| 0.95 | 0.94 |
+
+At the archive's measured mean of 0.883 the expected pass rate is ~0.72, and
+75% is what was observed. **A 90% pass rate at a 7-of-8 bar requires nearly
+every elite to be genuinely 95%-robust**, which is a much stronger demand than
+"the gate matches the bar" — the criterion and the gate are not the same
+threshold, and I did not notice that when the criterion was set.
+
+And there is a mechanism pushing the archive *down* as the search runs, visible
+in the table above: robustness goes **83% (it 10) -> 74% (it 24) -> 75% (it 50)**
+while raw coverage climbs 67% -> 82% -> 89%. **The winner's curse applies to
+the survival predicate, not only to the fitness.** j003 removed luck-ranking
+from fitness by taking a median instead of a maximum; survival is still a
+max-like operator — an elite is in the archive because it passed unanimously
+*once*, out of ~51,000 candidate evaluations. A genuinely 88%-robust genome
+passes unanimous-8 with probability 0.36, so with enough attempts the archive
+fills with exactly those. Raising N raises the exponent but never removes the
+selection: it is the same asymmetry, one level up.
+
+**The fix this points at is not a bigger N.** It is what v2's README already
+named as the open direction and neither run built: a **running survival
+estimate per cell that accumulates across an elite's lineage**, or simply
+re-testing incumbents so that an elite has to keep passing rather than pass
+once. That converts survival from a one-shot maximum into an average, which is
+precisely what taking the median did for fitness. It is the obvious next thing
+to build, and it is not built here.
+
 ### Reproduction
 
 ```bash
@@ -1323,12 +1448,24 @@ uv run python -m qd.verify_archive --archive logs/qd/pga_me_v3/archive_final.npz
 uv run python -m qd.verify_archive --archive logs/qd/pga_me_v3/archive_budget.npz
 ```
 
+```bash
+# the replication ablation: identical, except replicas stay in their world
+uv run python -m qd.pga.run_pga_me --iterations 10 --batch-size 1024 \
+    --initial-solutions 1024 --seed-genome logs/qd/seeds/ppo_seeds.npz \
+    --seeding.jitter-count 240 --insertion-replicas 8 \
+    --no-insertion-permute-worlds --td3.replay-buffer-size 2000000 \
+    --descriptor.axis-x torso_height_mean --descriptor.x-range 0.11667 0.12184 \
+    --descriptor.axis-y joint_speed --descriptor.y-range 0.89228 2.50831 \
+    --out-dir logs/qd/pga_me_v3_inplace_ablation
+```
+
 `--budget-checkpoint-evals 207049` snapshots the archive the moment the run
 passes j003's evaluation count, so the v2-vs-v3 comparison can be read both at
 equal cost and at full budget. Measured on an RTX 3060: iteration 0 (seed block
-plus random initialisation, 16 rollouts) 288 s, then **145 s per iteration** —
-**2.1 h** for 2.06x j003's evaluations, because eight replicas of one batch
-amortise better than eight separate generations.
+plus random initialisation, 16 rollouts) 278 s, then **141 s per iteration** —
+**426,392 evaluations in 2.03 h**, 2.06x j003's evaluations for 1.4x its wall
+clock, because eight replicas of one batch amortise better than eight separate
+generations.
 
 ## Watching the gaits
 
@@ -1421,14 +1558,25 @@ runs used, or the QD-scores are not comparable.
 ## Later upgrades (not built)
 
 * ~~Re-evaluation on insertion.~~ **Built** — `--insertion-replicas`, see
-  [above](#the-gate-is-necessary-and-not-sufficient-re-evaluation-on-insertion).
-  What remains open is the *shape* of it: this implementation spends N rollouts
-  on every candidate, including the ones that fall in the first replica and can
-  never pass. A sequential rule — one rollout, and only survivors earn a second
-  — would buy most of the filtering at a fraction of the cost, and on a run
-  where two thirds of offspring fall immediately that is a large fraction.
-  Higher N, or a per-cell running mean that accumulates evidence across an
-  elite's whole lineage, are the other directions.
+  [above](#the-gate-is-necessary-and-not-sufficient-re-evaluation-on-insertion),
+  and made to sample independently in v3
+  ([`--insertion-permute-worlds`](#the-replicas-were-not-independent-and-that-is-most-of-why-v2-failed)).
+  What remains open is the *shape* of it, and v3 measured why it matters. This
+  implementation spends N rollouts on every candidate, including the ones that
+  fall in the first replica and can never pass; a sequential rule — one rollout,
+  and only survivors earn a second — would buy most of the filtering at a
+  fraction of the cost.
+* **Survival as an average, not a maximum.** The most important open item, and
+  v3's clearest negative result. An elite is in the archive because it passed a
+  unanimous-N gate *once*, out of ~51,000 candidate evaluations, so the
+  winner's curse that j003 removed from the fitness column is still fully
+  operative on the survival column: measured archive robustness *falls* from
+  83% to 75% as the search runs and the number of attempts grows. Raising N
+  raises the exponent and does not remove the selection. A **per-cell running
+  survival estimate that accumulates across an elite's lineage** — or simply
+  re-testing incumbents, so an elite has to keep passing rather than pass once
+  — converts survival into an average, which is exactly what the median did for
+  fitness.
 * ~~A descriptor this robot can actually move in.~~ **Built** — see
   [Walking v3](#stage-a--choosing-the-axes-by-measurement). The prediction that
   "stride length, lateral drift, energy or a turning rate would all vary more"

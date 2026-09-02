@@ -77,15 +77,20 @@ class SeedCfg:
     """``(vx, vy, wz)`` twist commands to distil, one student genome each.
 
     Empty means "just ``teacher_vx`` forward". Several commands means several
-    seeds, and that is a diversity lever, not a convenience: the descriptor is
-    per-foot duty factor, and the map from MLP weights to duty factor turns out
-    to be *flat* near a walker — GA variation at the largest per-weight step
-    that still leaves the policy upright barely moves the duty factors, so a
-    single-seed archive stalls at the seed's own neighbourhood. The teacher, by
-    contrast, walks differently on command: a 0.1 m/s shuffle, a 0.4 m/s stride
-    and a turn-in-place are structurally different gaits that are all feasible
-    by construction. Distilling several of them opens the archive across the
-    descriptor instead of at one point in it.
+    seeds, and that is a diversity lever, not a convenience: the map from MLP
+    weights to duty factor is *flat* near a walker — GA variation at the largest
+    per-weight step that still leaves the policy upright barely moves the duty
+    factors, so a single-seed archive stalls at the seed's own neighbourhood
+    (measured: 17 elites by iteration 19, against 38 by iteration 20 with six
+    seeds). Each command gives the search a different feasible *weight-space*
+    neighbourhood to work outward from.
+
+    What it does **not** do, despite the intuition, is spread the descriptor.
+    Six commands whose teacher displacements span 0.41 m to 2.42 m distil to
+    duty factors within 0.03 of each other — see the README's "per-foot duty
+    factor barely varies among upright gaits". The gain here is weight-space
+    diversity, not behaviour-space diversity, and the honest fix for the latter
+    is a different descriptor.
 
     Every command still yields a policy the archive sees under a **zero**
     observation, since the command is baked into the weights."""

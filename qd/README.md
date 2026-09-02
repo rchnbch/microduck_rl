@@ -707,10 +707,9 @@ genome-to-descriptor map, not of the hyperparameters.
 
 What *does* produce structurally different, feasible gaits is the thing that
 produced the seed in the first place. The PPO teacher walks differently **on
-command**: a 0.1 m/s shuffle keeps both feet down most of the time, a 0.4 m/s
-stride lifts them, a forward-plus-turn makes the two feet do different jobs and
-splits the duty factors apart. Every one of those is feasible by construction.
-So v2 distils several of them:
+command** — a 0.1 m/s shuffle, a 0.4 m/s stride, a forward-plus-turn — and every
+one of those is feasible by construction, which is what weight-space mutation
+cannot manufacture. So v2 distils several of them:
 
 ```bash
 uv run python -m qd.seed \
@@ -727,14 +726,73 @@ neighbourhood (`jitter_count` split evenly), which costs no extra evaluations �
 the seed block is one fixed-size rollout either way, it simply spends fewer of
 its worlds on random MLPs.
 
-This is a statement about where diversity has to come from in a survival-gated
-QD run over neural policies, and it generalises past this robot: once
+**Did it work? Partly, and not for the reason predicted.** The archive improved
+a lot — 38 elites by iteration 20 against the single-seed run's 17 by iteration
+19, with feasibility 55-87% against 30-40%. But the six commands did **not**
+spread the duty factors: they land within 0.03 of each other, which is under two
+cells. What helped was six different *weight-space* neighbourhoods and a ladder
+of jitter radii around each, not the commands separating in descriptor space.
+The next section is the measurement, and it is the more important result.
+
+The general point survives intact, and generalises past this robot: once
 not-falling is a constraint, the feasible set is a thin manifold, isotropic
 mutation cannot travel along it, and the archive's spread is set by how diverse
 its *feasible seeding* was. A richer answer would be a variation operator that
 moves along the manifold rather than across it — which is what PG variation is
 supposed to be, and would be if the critic knew about the descriptor. That is
 the obvious next thing to build, and it is not built here.
+
+### Negative result: per-foot duty factor barely varies among upright gaits
+
+This one is worth reading before designing another run on this archive, because
+it says the behaviour descriptor is not measuring much.
+
+Three independent measurements, all pointing the same way.
+
+**Commanded gaits that differ a lot in speed do not differ in duty factor.**
+The six distilled seeds come from twist commands spanning the velocity task's
+whole forward range, and the teacher's own displacement over 7 s spans 6x across
+them. Their duty factors span 0.03:
+
+| teacher command (vx, vy, wz) | teacher travels | seed duty (L, R) |
+| --- | --- | --- |
+| (0.10, 0, 0) | +0.41 m | (0.48, 0.57) |
+| (0.20, 0, 0) | +0.83 m | (0.46, 0.57) |
+| (0.30, 0, 0) | +1.64 m | (0.48, 0.55) |
+| (0.40, 0, 0) | +2.42 m | (0.49, 0.54) |
+| (0.25, 0.15, 0) — forward + strafe | +1.30 m | (0.47, 0.56) |
+| (0.25, 0, 0.5) — forward + turn | +1.24 m | (0.48, 0.57) |
+
+A shuffle and a stride, a straight walk and a turn, all inside two cells of a
+20x20 grid. Whatever distinguishes those gaits, this descriptor cannot see it.
+
+**Mutation cannot move it either.** GA variation runs at the largest per-weight
+step that leaves the policy upright (`iso_sigma` 0.005, mean drift 4e-3, against
+the ~6e-3 at which `tune_pg` measured feasibility collapsing), and at that step
+offspring stay feasible ~40-60% of the time and land almost entirely in cells
+that are already filled — that is the single-seed stall above, and it is a
+property of the genome-to-descriptor map rather than of the hyperparameters.
+
+**Chance cannot move it.** 256 byte-identical copies of one genome, whose
+*displacement* spreads with a standard deviation of 0.605 m, have a duty-factor
+standard deviation of **0.014** — about a quarter of a cell. The objective is
+chaotic and the descriptor is stable.
+
+So: the reachable-while-upright region of this descriptor is genuinely small,
+and v2's low raw coverage is mostly that, not a failure of search. v1's 73-85%
+raw coverage was overwhelmingly *fallen* policies, whose duty factors are set by
+how they happened to collapse — a robot lying on both soles reads (1, 1), a
+face-plant reads whatever its last upright step did. Coverage over a
+fall-populated archive is a measure of the ways this robot can fall.
+
+**Implication for the next run: change the descriptor, not the search.** Stride
+length, lateral drift, cost of transport, turning rate or trunk-pitch amplitude
+would all vary across the six gaits above, where duty factor does not. Per-foot
+duty factor is Cully et al.'s hexapod descriptor and it earns its reputation on
+a robot with six legs and many ways to distribute contact; on a biped that can
+only stay upright by alternating its two feet at roughly even duty, it is close
+to a constant. That is not an argument against QD here — it is an argument that
+the axes were the wrong ones, and picking better ones is cheap.
 
 ### The greedy actor, and what TD3 is actually for here
 

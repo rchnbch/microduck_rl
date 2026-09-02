@@ -300,6 +300,14 @@ re-running the genomes. Reproduce with
 with extra steps. The elite that travels furthest (+0.403 m) falls before the
 episode ends. Nothing in either archive both stays up and goes anywhere.
 
+> **And that lone survivor does not survive honest physics.** Re-measured under
+> v2's model — every shell colliding with the ground rather than the two soles
+> — the top 64 elites of *both* v1 archives contain **zero** full-episode
+> survivors: longest upright 4.70 s for the MLP archive and 1.82 s for the CPG,
+> against archived claims of 7.00 s and 2.10 s. The v1 MLP archive is also
+> +0.277 m optimistic on that re-measurement. So the count of survivors in v1
+> is not one. It is none.
+
 That is the real state of this work, and it is worth stating plainly because
 every aggregate metric above hides it: fitness rewards distance *and* staying
 up, so a high score can come from either, and only the survivor-displacement row

@@ -47,12 +47,16 @@ uv run python -m qd.bench           # ms/genome vs batch size, fitness noise
 ```
 
 After a run, to see whether the elites actually *walk* rather than just score
-well — the pro-rata penalty means a high fitness can come either from covering
-ground fast before falling or from staying up, and the archive does not record
-which:
+well. In a v1 archive that is a question about the objective — the pro-rata
+penalty means a high fitness can come either from covering ground fast before
+falling or from staying up, and the archive does not record which. In a gated
+v2 archive every member survived on insertion, so the question becomes whether
+they *still* do, and how far they get, over replicas:
 
 ```bash
 uv run python -m qd.survival_report --archive logs/qd/map_elites/archive_final.npz
+uv run python -m qd.survival_report --archive logs/qd/pga_me_v2/archive_final.npz \
+    --sample 64 --replicas 8
 ```
 
 ## Install
@@ -865,20 +869,38 @@ critic needs in its buffer to learn what not to do.
 ```bash
 # render every filled cell to mp4 (needs the MUJOCO_GL prefix — see below)
 MUJOCO_GL=glfw uv run python -m qd.render_gaits \
-    --archive logs/qd/map_elites/archive_final.npz --out logs/qd/gaits/cpg
-MUJOCO_GL=glfw uv run python -m qd.render_gaits \
-    --archive logs/qd/pga_me_matched/archive_final.npz --out logs/qd/gaits/pga
+    --archive logs/qd/pga_me_v2/archive_final.npz --out logs/qd/gaits/v2
 
-# build the clickable page
+# the two v1 archives, rendered under v1 physics so the clips match the
+# numbers that archive was searched under (`--no-full-collision`
+# `--no-trim-at-fall` reproduces exactly what v1 published)
+MUJOCO_GL=glfw uv run python -m qd.render_gaits \
+    --archive logs/qd/map_elites/archive_final.npz --out logs/qd/gaits/cpg \
+    --no-full-collision --no-trim-at-fall
+MUJOCO_GL=glfw uv run python -m qd.render_gaits \
+    --archive logs/qd/pga_me_matched/archive_final.npz --out logs/qd/gaits/pga \
+    --no-full-collision --no-trim-at-fall
+
+# build the clickable page: three archives, one switcher
 uv run python -m qd.build_viewer \
-    --manifests logs/qd/gaits/cpg/manifest.json logs/qd/gaits/pga/manifest.json \
-    --labels "MAP-Elites" "PGA-ME" --out logs/qd/viewer/index.html
+    --manifests logs/qd/gaits/cpg/manifest.json \
+                logs/qd/gaits/pga/manifest.json \
+                logs/qd/gaits/v2/manifest.json \
+    --labels "v1 MAP-Elites (CPG)" "v1 PGA-ME (MLP)" "v2 gated + seeded" \
+    --budget-mb 3.3 --out logs/qd/viewer/index.html
 ```
 
 The page is a 20×20 heatmap you click: pick a cell and that elite's gait plays
 beside its fitness, duty factors, distance, time upright and outcome. Arrow keys
-step to the nearest *filled* cell, since the archive has holes. Two manifests
-give an archive switcher.
+step to the nearest *filled* cell, since the archive has holes. Each manifest
+adds an entry to the archive switcher, and `--budget-mb` is **per archive**, so
+three archives on one page need about a third of the per-archive budget two did.
+
+**v2 clips end at the fall.** `--trim-at-fall` (on by default) cuts each clip on
+the frame that world's fall was detected, so a clip is exactly the trajectory
+that was scored — no frames the fitness, descriptor and replay buffer all
+refused to look at. In a gated v2 archive every elite is a survivor, so nothing
+is trimmed there; it is the *v1* archives, replayed, where the difference shows.
 
 **`MUJOCO_GL` must be set before Python starts** — MuJoCo resolves its GL
 backend at import time, so setting it in code is too late. On this WSL2 box
@@ -932,6 +954,29 @@ runs used, or the QD-scores are not comparable.
 
 ## Later upgrades (not built)
 
+* **Re-evaluation on insertion.** The single most valuable thing not built
+  here, and the measurement that says so is
+  [above](#the-finding-that-reframes-every-number-here-a-walkers-fitness-is-chaotic):
+  one rollout of a walker has a 0.6 m standard deviation in displacement, and
+  MAP-Elites inserts on one sample and keeps the maximum, so archived values
+  rank luck as much as ability (+0.60 m of it, measured). Re-evaluating a
+  candidate before insertion, or keeping a running mean per cell, fixes it at
+  the cost of a second evaluation per candidate — half the archive at the same
+  budget. Whether that trade is worth it is itself an experiment worth running,
+  and it is the one to run next.
+* **A descriptor this robot can actually move in.** Per-foot duty factor is
+  nearly invariant across everything the robot can do without falling: six
+  teacher commands spanning a 0.41 m to 2.42 m stride all distil to duty
+  factors within 0.03 of each other, and 256 identical replicas of one genome
+  spread only 0.014. Stride length, lateral drift, energy or a turning rate
+  would all vary more, and a QD archive is only as interesting as the axes it
+  is binned on.
+* **A descriptor-aware PG operator.** PG variation currently ascends Q, which
+  knows nothing about the behaviour descriptor, so it improves elites in place
+  instead of moving them to new cells. A critic conditioned on a target
+  descriptor would make the gradient half of PGA-ME an *exploration* operator
+  rather than a refinement one — which is exactly what a survival-gated search
+  over a thin feasible manifold needs.
 * **CMA-ME** — swap the `GaussianEmitter` for pyribs'
   `EvolutionStrategyEmitter`, which adapts a covariance matrix per emitter and
   usually beats isotropic mutation badly on a 31-D search space. Deliberately

@@ -1472,6 +1472,101 @@ plus random initialisation, 16 rollouts) 278 s, then **141 s per iteration** —
 clock, because eight replicas of one batch amortise better than eight separate
 generations.
 
+## Walking v4 — modes of forward motion, and a gate that admits them
+
+Alex's verdict on v3: *"the behaviours are not different enough… I don't just
+want walking."* v3's archive is 268 verified walkers in 109 resolvable cells,
+and every one of them is a walker, because the gate said so: `base z < 0.075`
+is "fallen", and the verified-stable SIT keyframe sits at 0.061 m. **Every
+non-walking rest pose this robot has is fallen to v3, before the first step.**
+
+v4 replaces the gate, not the search. The design is
+[`docs/qd_mode_descriptors_draft.md`](../docs/qd_mode_descriptors_draft.md);
+this section is what it measured out to be.
+
+### 0. The contact model was wrong, and it was wrong invisibly
+
+Before any of it, a sim2real footgun of exactly the kind AGENTS.md lists.
+
+`FULL_COLLISION` addresses geoms by **name**:
+
+```python
+CollisionCfg(geom_names_expr=[".*_collision"],
+             condim={r"^(left|right)_foot_collision$": 3, ".*_collision": 1}, ...)
+```
+
+`onshape-to-robot` names a geom only when the CAD part is tagged, and it tags
+two: the soles. So the `condim=1` rule written to make the shells frictionless
+**has never matched a geom**. Read off the compiled model:
+
+| | legacy | fixed |
+| --- | --- | --- |
+| geoms that can touch the ground | 10 | **14** |
+| of those, *named* | 2 | **14** |
+| shell `condim` / `priority` / `mu` | 3 / 0 / **1.0** (MuJoCo defaults) | 3 / **1** / **0.4** |
+
+Two more consequences of the anonymity, both silent:
+
+* `CollisionCfg.disable_other_geoms` collects the non-matching names into a
+  **set**, so ~70 unnamed geoms collapse to a single `''` entry and at most one
+  of them is ever disabled. The shells were live by accident, not by design.
+* `priority 0` means the pair is mixed elementwise (`max` for friction), so a
+  shell set to `mu = 0.4` against a `mu = 1` floor still slides at 1.0. Only
+  `priority >= 1` on the robot geom makes the number written the number used —
+  which is why the soles already carried it and nothing else did.
+
+And the export gives **no ground-collision geom at all** to the upper legs or
+the trunk side shells — exactly what a prone or side-lying robot rests on.
+
+`robot/shell_contacts.py` fixes all three on the `MjSpec`, not in the generated
+MJCF, so a re-export from Onshape cannot undo it. What it is worth, measured by
+settling each rest pose for 3 s on both models (`qd.check_shell_contacts`):
+
+| pose | legacy settled z | fixed settled z | sink | what carries it on the fixed model |
+| --- | --- | --- | --- | --- |
+| stand (topples, as it must) | 0.0474 | 0.0438 | +3.6 mm | soles, jaw |
+| prone | 0.0352 | 0.0353 | −0.1 mm | hips, soles, jaw |
+| supine | 0.0471 | 0.0476 | −0.5 mm | **trunk side shells**, top head shell, soles |
+| **side** | 0.0408 | **0.0669** | **−26.1 mm** | **upper leg**, jaw |
+| sit | 0.0651 | 0.0643 | +0.8 mm | soles, shanks, **upper legs** |
+
+A side-lying robot used to settle 26 mm too low — resting on a thigh that did
+not exist. Four of the five poses are now carried, at least in part, by a geom
+the export never had.
+
+**The shell `mu` is a literature value, not a hardware measurement**, and it is
+labelled as such in `microduck_constants.SHELL_FRICTION`: 0.4 is the mid-point
+of the published range for PLA on a hard smooth floor, with
+`SHELL_FRICTION_RANGE = (0.25, 0.65)` for DR and a sensitivity sweep
+(`--sweep-friction`) so the choice is revisable against one measurement rather
+than baked into a policy. What it replaces is worse than a guess: printed
+plastic gripping the floor exactly as hard as the rubber soles.
+
+#### The cost, stated: self-collision goes up
+
+Naming the shells makes them addressable; adding the thigh and side-shell geoms
+makes them *touchable*, including by each other. Six env cfgs in this repo
+charge a `self_collision` penalty, so this is a real change to their reward
+baselines. Measured over random joint configurations at several distances from
+HOME (CPU, base held clear of the floor so only self-contacts remain):
+
+| joint sampling | legacy mean | fixed mean | legacy any | fixed any |
+| --- | --- | --- | --- | --- |
+| HOME | 0.000 | 0.000 | 0.000 | 0.000 |
+| HOME + N(0, 0.1) | 0.005 | 0.007 | 0.004 | 0.006 |
+| HOME + N(0, 0.3) | 0.291 | 0.523 | 0.226 | 0.311 |
+| HOME + N(0, 0.6) | 0.747 | 1.732 | 0.463 | 0.605 |
+| uniform over limits | 0.885 | 2.385 | 0.428 | 0.577 |
+
+**No constant tax**: at HOME and in the ±0.1 rad neighbourhood a walking policy
+occupies, the change is 0.005 → 0.007 contacts per configuration. The increase
+appears in folded, large-excursion poses, and the pairs it comes from —
+`bottom_head_shell x trunk_side_shell` above all — are physically real: the head
+is 38 % of body mass and it really can hit the side of the torso. Tasks that
+deliberately fold (standup, roulade, the crawl task to come) should expect a
+slightly larger self-collision reading and should be re-baselined rather than
+surprised.
+
 ## Watching the gaits
 
 ```bash

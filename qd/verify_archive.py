@@ -76,7 +76,7 @@ def main(args: Args | None = None) -> None:
         flush=True,
     )
     # Elite-major, so a reshape recovers the per-elite axis after chunking.
-    _, measures, info, control_dt = reevaluate(
+    _, measures, info, _dt = reevaluate(
         np.repeat(solutions, reps, axis=0),
         kind,
         args.fitness,
@@ -92,7 +92,7 @@ def main(args: Args | None = None) -> None:
     keep = survival_rate >= args.min_survival
 
     def cells(mask):
-        return int(len(np.unique(data["index"][mask]))) if mask.any() else 0
+        return len(np.unique(data["index"][mask])) if mask.any() else 0
 
     summary = {
         "archive": str(args.archive),
@@ -123,6 +123,34 @@ def main(args: Args | None = None) -> None:
             float(measures[:, :, 1].std(axis=1).mean()),
         ],
     }
+
+    # A single pass/fail threshold hides how the archive is distributed, and
+    # picking one after seeing the numbers is how a report flatters itself. The
+    # sweep is reported whole, and it is the same sweep for every archive.
+    summary["threshold_sweep"] = [
+        {
+            "min_survival": float(t),
+            "elites": int((survival_rate >= t).sum()),
+            "cells_over_0.25m": cells((survival_rate >= t) & (median_displacement >= 0.25)),
+            "cells_over_0.50m": cells((survival_rate >= t) & (median_displacement >= 0.50)),
+            "best_median_m": (
+                float(median_displacement[survival_rate >= t].max())
+                if (survival_rate >= t).any()
+                else None
+            ),
+        }
+        for t in (0.5, 0.625, 0.75, 0.875, 1.0)
+    ]
+    print(f"\nsurvivors by verification strictness (of {n} raw elites):")
+    print(f"  {'needs':>12} {'elites':>7} {'>=0.25m':>8} {'>=0.50m':>8} {'best m':>8}")
+    for row in summary["threshold_sweep"]:
+        best = row["best_median_m"]
+        print(
+            f"  {row['min_survival'] * reps:>5.0f}/{reps} replicas "
+            f"{row['elites']:>7d} {row['cells_over_0.25m']:>8d} "
+            f"{row['cells_over_0.50m']:>8d} "
+            + (f"{best:>+8.3f}" if best is not None else f"{'—':>8}")
+        )
 
     hist = np.histogram(survival_rate, bins=np.linspace(0, 1, reps + 2))[0]
     print(f"\nsurvival rate over {reps} replicas, per elite:")

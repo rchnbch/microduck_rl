@@ -980,6 +980,106 @@ expected to shift the distribution, and the honest test is the same 8-replica
 verification applied to both runs. Pushing N higher trades search harder still:
 at N=8 the run would get 25 iterations.
 
+
+### Results — v1 vs v2, all on medians
+
+> **Read this first, or the table below will mislead you.** On this simulator a
+> walking policy's displacement has a **standard deviation of 0.605 m** across
+> byte-identical worlds, and MAP-Elites inserts on one sample and keeps the
+> maximum — so an *archived* value estimates an elite's best luck, by a measured
+> **+0.64 to +0.94 m**. Every "verified" number below is instead the **median of
+> 8 fresh rollouts** per elite, and an elite counts as surviving only if it
+> stayed upright in at least 7 of those 8. Archived values appear only in the
+> row labelled as such.
+
+Three runs, all at ~207,000 evaluations on one RTX 3060:
+
+| | v1 MAP-Elites (CPG) | v1 PGA-ME (MLP) | v2 single-sample | v2 re-evaluated |
+| --- | --- | --- | --- | --- |
+| **what it is** | open-loop CPG, fall penalty | closed-loop MLP, fall penalty | gated + seeded, 200 it | gated + seeded, **99 it x 2 replicas** |
+| **VERIFIED — 8 fresh rollouts per elite** | | | | |
+| elites surviving >= 7 of 8 | **0** | **0** | 4 | **5** |
+| best verified median displacement | — | — | +1.620 m | **+2.117 m** |
+| cells with a verified elite >= 0.25 m | 0 | 0 | 4 | **5** |
+| **STRUCTURE — raw, counts nothing about robustness** | | | | |
+| elites | 340 | 292 | 81 | 62 |
+| raw coverage | 85.0% | 73.0% | 20.2% | 15.5% |
+| *archived best (optimistic)* | *+0.153 m* | *+0.504 m* | *+2.970 m* | *+3.554 m* |
+| *archive optimism* | *-0.217 m* | *-0.064 m* | *+0.643 m* | *+0.897 m* |
+
+**v1's archives contain no robust walkers at all.** Not one of 632 elites across
+both v1 archives survives 7 of 8 fresh rollouts under honest physics. v1's raw
+coverage of 85% and 73% is a map of the ways this robot can fall over.
+
+**v2 produces walkers that travel two metres and keep their feet.** Against
+j002's headline — "the single policy that stays upright covers 8.8 cm" — the
+best verified v2 elite covers **+2.117 m**, about 24x further, and does it in
+five of eight independent rollouts.
+
+#### Verification strictness, reported whole
+
+A single pass/fail threshold hides the distribution, and choosing one after
+seeing the numbers is how a report flatters itself. So here is the whole sweep,
+the same for both v2 archives:
+
+| survives at least | v2 single-sample | | | v2 re-evaluated | | |
+| --- | --- | --- | --- | --- | --- | --- |
+| | elites | cells >=0.25 m | cells >=0.50 m | elites | cells >=0.25 m | cells >=0.50 m |
+| 4 of 8 | 23 | 13 | 11 | 23 | **20** | **19** |
+| 5 of 8 | 16 | 11 | 9 | 17 | **17** | **16** |
+| 6 of 8 | 7 | 7 | 5 | 10 | **10** | **10** |
+| 7 of 8 | 4 | 4 | 2 | 5 | **5** | **5** |
+| 8 of 8 | 3 | 3 | 1 | 3 | 3 | **3** |
+
+Two things to read off it. First, **the re-evaluated run dominates at every
+threshold** on cells above a distance, and its best verified elite goes +2.117 m
+against +1.620 m. Second, and more telling: in the re-evaluated archive the
+"elites" and "cells >= 0.50 m" columns are *the same number* at every strictness
+level. It has no weak survivors. The single-sample archive's do not match at any
+level — a third to a half of what survives there goes nowhere.
+
+**The verification is itself a sample.** Running the same 8-replica check twice
+on the same archives gave 7 and 8 verified elites the first time and 4 and 5 the
+second. That is not a bug; it is the same chaos, one level up. Treat every count
+in these tables as carrying an uncertainty of a few elites, and treat the
+*ordering* between the two runs — which held in both passes — as the result.
+
+#### The cost of the fix, stated as a trade
+
+The re-evaluated run bought its reliability with **half the search**: 99
+iterations instead of 200, at 1024 offspring each, for the same 207,048
+evaluations. It ended with 62 elites against 81 and 15.5% raw coverage against
+20.2%. Fewer genomes tried, each worth believing. On the verified columns —
+the only ones that mean anything here — it wins outright.
+
+#### Where the honest numbers leave the acceptance criteria
+
+Two of this job's criteria are met and two are not, and the failures share one
+cause:
+
+* **PASS** — best replay-verified elite >= 0.5 m in 7 s, and >= 5x j002's best
+  survivor (0.088 m). Measured: **+2.117 m**, 24x.
+* **PASS** — physics honest, no clip below the floor, seeds replay-verified at
+  iteration 0, both GA and PG contributing (re-evaluated run: GA 0.54% and PG
+  0.32% mean insertion, GA 34.0% and PG 31.5% mean feasibility — the same ~2:1
+  GA:PG ratio v1 reported at 3.7%/1.8%).
+* **FAIL** — ">= 90% of 64 sampled elites survive on independent replay."
+  Measured: 8% at 7-of-8, 37% at 4-of-8. The archive is 100% survivors *by
+  construction* and a minority of them in fact.
+* **FAIL** — ">= 20 distinct cells hold elites >= 0.25 m" on verified medians.
+  Measured: 5 at 7-of-8, and exactly 20 at 4-of-8 — so it passes only at the
+  loosest reading of "survives", which is not the reading worth having.
+
+Both failures are the same problem at different depths: **two insertion replicas
+is a much weaker filter than eight-replica verification.** A policy that survives
+2 of 2 still has a 95% interval on its true survival rate reaching down to ~0.22.
+The fix worked in the direction and roughly the magnitude predicted before it
+was run — measured on the same verification pass, mean survival rate per elite
+**0.296 -> 0.395** and elites that never survive a single replay **17 -> 5** —
+and it did not reach 90%, which at matched budget would need something like
+N=8 and 25 iterations. That is a different experiment, and Alex's call rather
+than this job's.
+
 ### Budget and reproduction
 
 Budget-matched to v1's 207,048 evaluations:

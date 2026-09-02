@@ -117,6 +117,32 @@ def main(args: Args | None = None) -> None:
     # says what the archive's *effective* resolution is: the k at which an
     # elite reliably returns to its own cell is the resolution its geography
     # can actually support, whatever the 20x20 the run was binned at.
+    # How many cells does the descriptor's own reproducibility actually
+    # support? An archived measure is a median over `reps` replicas, so its
+    # standard error is the within-elite sd over root-reps. Two elites one bin
+    # apart differ by a quantity whose sd is root-2 times that, so bins
+    # 2*root-2 sigma wide are the finest at which *adjacent* cells are
+    # separated at about two sigma. That width, not the grid the run was binned
+    # at, is what a coverage number should be read against — and it is capped
+    # at the grid's own resolution, since the archive cannot hold more cells
+    # than it has.
+    sigma_median = np.array(
+        [measures[:, :, k].std(axis=1).mean() / np.sqrt(reps) for k in range(2)]
+    )
+    axis_span = np.array([hi - lo for lo, hi in descriptor.ranges])
+    resolvable_dims = tuple(
+        int(np.clip(np.floor(axis_span[k] / (2 * np.sqrt(2) * sigma_median[k])), 1, dims[k]))
+        for k in range(2)
+    )
+    resolvable_cell = grid_indices(
+        median_measures, resolvable_dims, descriptor.ranges
+    )
+
+    def resolvable_cells(mask):
+        if not mask.any():
+            return 0
+        return int(len(np.unique(resolvable_cell[mask], axis=0)))
+
     resolution_sweep = [
         {
             "coarsen": int(k),
@@ -161,6 +187,20 @@ def main(args: Args | None = None) -> None:
         "verified_cells_over_0.25m": cells(keep & (median_displacement >= 0.25)),
         "verified_cells_over_0.50m": cells(keep & (median_displacement >= 0.50)),
         "verified_cells_over_1.00m": cells(keep & (median_displacement >= 1.00)),
+        # The same counts re-binned at the resolution the descriptor supports.
+        # Quote these first: a cell count on a grid finer than the measurement
+        # is a count of quantization, not of behaviours.
+        "resolvable_grid": list(resolvable_dims),
+        "descriptor_median_se": sigma_median.tolist(),
+        "resolvable_cells_over_0.25m": resolvable_cells(
+            keep & (median_displacement >= 0.25)
+        ),
+        "resolvable_cells_over_0.50m": resolvable_cells(
+            keep & (median_displacement >= 0.50)
+        ),
+        "resolvable_cells_over_1.00m": resolvable_cells(
+            keep & (median_displacement >= 1.00)
+        ),
         # --- the cost of inserting on a single sample ---
         "archive_optimism_mean_m": float(np.mean(archived - median_displacement)),
         "archive_optimism_median_m": float(np.median(archived - median_displacement)),
@@ -193,6 +233,12 @@ def main(args: Args | None = None) -> None:
             "elites": int((survival_rate >= t).sum()),
             "cells_over_0.25m": cells((survival_rate >= t) & (median_displacement >= 0.25)),
             "cells_over_0.50m": cells((survival_rate >= t) & (median_displacement >= 0.50)),
+            "resolvable_cells_over_0.25m": resolvable_cells(
+                (survival_rate >= t) & (median_displacement >= 0.25)
+            ),
+            "resolvable_cells_over_0.50m": resolvable_cells(
+                (survival_rate >= t) & (median_displacement >= 0.50)
+            ),
             "best_median_m": (
                 float(median_displacement[survival_rate >= t].max())
                 if (survival_rate >= t).any()
@@ -202,13 +248,18 @@ def main(args: Args | None = None) -> None:
         for t in (0.5, 0.625, 0.75, 0.875, 1.0)
     ]
     print(f"\nsurvivors by verification strictness (of {n} raw elites):")
-    print(f"  {'needs':>12} {'elites':>7} {'>=0.25m':>8} {'>=0.50m':>8} {'best m':>8}")
+    print(
+        f"  cells are reported as resolvable ({resolvable_dims[0]}x"
+        f"{resolvable_dims[1]}) / raw ({dims[0]}x{dims[1]})"
+    )
+    print(f"  {'needs':>12} {'elites':>7} {'>=0.25m':>11} {'>=0.50m':>11} {'best m':>8}")
     for row in summary["threshold_sweep"]:
         best = row["best_median_m"]
         print(
             f"  {row['min_survival'] * reps:>5.0f}/{reps} replicas "
-            f"{row['elites']:>7d} {row['cells_over_0.25m']:>8d} "
-            f"{row['cells_over_0.50m']:>8d} "
+            f"{row['elites']:>7d} "
+            f"{str(row['resolvable_cells_over_0.25m']) + '/' + str(row['cells_over_0.25m']):>11} "
+            f"{str(row['resolvable_cells_over_0.50m']) + '/' + str(row['cells_over_0.50m']):>11} "
             + (f"{best:>+8.3f}" if best is not None else f"{'—':>8}")
         )
 
@@ -250,10 +301,14 @@ def main(args: Args | None = None) -> None:
         f"({keep.mean() * 100:.0f}% survive >= {args.min_survival:.0%} of replicas), "
         f"{keep.sum() / total_cells * 100:.1f}% coverage, "
         f"best median {summary['best_verified_median_displacement_m'] or float('nan'):+.3f} m\n"
-        f"cells with a verified elite over 0.25 m: "
+        f"cells with a verified elite, resolvable ({resolvable_dims[0]}x"
+        f"{resolvable_dims[1]}) / raw ({dims[0]}x{dims[1]}) — "
+        f"over 0.25 m: {summary['resolvable_cells_over_0.25m']}/"
         f"{summary['verified_cells_over_0.25m']}, "
-        f"over 0.50 m: {summary['verified_cells_over_0.50m']}, "
-        f"over 1.00 m: {summary['verified_cells_over_1.00m']}\n"
+        f"over 0.50 m: {summary['resolvable_cells_over_0.50m']}/"
+        f"{summary['verified_cells_over_0.50m']}, "
+        f"over 1.00 m: {summary['resolvable_cells_over_1.00m']}/"
+        f"{summary['verified_cells_over_1.00m']}\n"
         f"archive optimism (archived - verified median): "
         f"{summary['archive_optimism_mean_m']:+.3f} m mean, "
         f"{summary['archive_optimism_median_m']:+.3f} m median",

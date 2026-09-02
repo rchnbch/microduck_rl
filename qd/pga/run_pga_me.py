@@ -179,6 +179,23 @@ class Args:
     This costs exactly N x the evaluations, so a budget-matched run divides its
     iterations by N — half the genomes tried, each worth believing."""
 
+    insertion_permute_worlds: bool = True
+    """Shuffle which world each candidate occupies on every replica.
+
+    Measured on this simulator, and it is not a detail. A *world index* carries
+    a persistent bias: the same genome rolled out repeatedly in the same slot
+    varies by only 0.071 m in displacement, while the same genome placed in
+    different slots of one batch varies by 0.47 m. Walking-v2 replicated by
+    rolling the identical block again, i.e. every replica in the same slot — so
+    the gate sampled a fraction of the noise that ``qd.verify_archive``, which
+    replicates *across worlds*, then measured. A gate meant to match the bar was
+    quietly a sixth of it.
+
+    Permuting the assignment fixes it for free — same worlds, same count, same
+    wall clock — and measured over 6 replicas it recovers 3.2x the displacement
+    spread and 1.7x / 3.5x the per-axis descriptor spread. ``False`` reproduces
+    v2's behaviour exactly."""
+
     fitness: FitnessCfg = field(default_factory=FitnessCfg)
     reward: ShapedRewardCfg = field(default_factory=ShapedRewardCfg)
     td3: Td3Cfg = field(default_factory=Td3Cfg)
@@ -276,6 +293,46 @@ def combine_replicas(runs: list[tuple]) -> tuple:
     )
 
 
+def evaluate_replicas(
+    harness,
+    block: torch.Tensor,
+    reps: int,
+    generator: torch.Generator,
+    permute: bool = True,
+    bank=None,
+):
+    """Roll ``block`` out ``reps`` times and fold the replicas into one verdict.
+
+    A candidate survives only if it survived **every** replica, and its fitness
+    is the median displacement — so a cell is won by being reliably good rather
+    than by one good day. Every replica's transitions are banked; the critic has
+    no reason to see less data than was generated.
+
+    With ``permute``, each replica puts the candidate in a *different world*.
+    On this simulator a world index carries a persistent bias — the same genome
+    rolled out repeatedly in the same slot varies by 0.071 m against 0.47 m
+    across slots — so replicating in place samples a fraction of the noise
+    ``qd.verify_archive`` measures across worlds. Results are un-permuted before
+    they are combined, so row *i* of the output is still the genome on row *i*
+    of ``block``.
+    """
+    runs = []
+    n = int(block.shape[0])
+    for _ in range(reps):
+        if permute:
+            order = torch.randperm(n, generator=generator, device=block.device)
+            inv = torch.argsort(order).cpu().numpy()
+            fitness, measures, info, transitions = harness.rollout(block[order])
+            fitness, measures = fitness[inv], measures[inv]
+            info = {k: v[inv] for k, v in info.items()}
+        else:
+            fitness, measures, info, transitions = harness.rollout(block)
+        if bank is not None:
+            bank(transitions)
+        runs.append((fitness, measures, info))
+    return combine_replicas(runs)
+
+
 def main(args: Args | None = None) -> None:
     args = args or tyro.cli(Args)
     out = Path(args.out_dir)
@@ -325,19 +382,14 @@ def main(args: Args | None = None) -> None:
     reps = max(1, args.insertion_replicas)
 
     def evaluate(block: torch.Tensor):
-        """Roll a block out ``reps`` times; return the combined verdict.
-
-        A candidate survives only if it survived **every** replica, and its
-        fitness is the median displacement — so a cell is won by being reliably
-        good rather than by one good day. Every replica's transitions are
-        banked; the critic has no reason to see less data than was generated.
-        """
-        runs = []
-        for _ in range(reps):
-            fitness, measures, info, transitions = harness.rollout(block)
-            trainer.buffer.add(transitions)
-            runs.append((fitness, measures, info))
-        return combine_replicas(runs)
+        return evaluate_replicas(
+            harness,
+            block,
+            reps,
+            generator,
+            permute=args.insertion_permute_worlds,
+            bank=trainer.buffer.add,
+        )
 
     def evaluate_and_insert(block: torch.Tensor) -> tuple[dict, float, float]:
         """Roll a block out, bank its transitions, offer the survivors."""
@@ -549,6 +601,7 @@ def main(args: Args | None = None) -> None:
             "wall_clock_s": time.perf_counter() - t_start,
             "survival_gate": gate,
             "insertion_replicas": reps,
+            "insertion_permute_worlds": args.insertion_permute_worlds,
             "descriptor_axes": list(args.descriptor.names),
             "descriptor_ranges": [list(r) for r in args.descriptor.ranges],
             "full_collision": args.full_collision,
@@ -593,6 +646,7 @@ def _meta(args: Args, it: int, evals: int) -> dict:
         # a v2 archive are never silently reported as the same kind of thing.
         "survival_gate": args.survival_gate,
         "insertion_replicas": args.insertion_replicas,
+        "insertion_permute_worlds": args.insertion_permute_worlds,
         "full_collision": args.full_collision,
         "seeded": args.seed_genome is not None,
         # Read back by verify_archive / render_gaits / the viewer, so a v3

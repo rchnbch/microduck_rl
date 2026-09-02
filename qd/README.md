@@ -6,21 +6,24 @@ recipes train in.
 
 Where PPO returns one policy that maximizes a reward, MAP-Elites returns a
 **grid of policies**, one per bin of a behaviour descriptor, each the best of
-its kind. Here the descriptor is per-foot ground-contact duty factor, so the
-archive spans everything from a shuffle that never lifts a foot to a hopping
-gait with both feet airborne most of the time.
+its kind. v1 and v2 used per-foot ground-contact duty factor, Cully et al.'s
+hexapod descriptor; v2 then measured that a biped which can only stay upright
+by alternating its feet at roughly even duty barely moves in it, and v3
+replaces it with axes chosen by measurement.
 
-> **Read [Walking v2](#walking-v2--survival-gated-ppo-seeded-pga-me) first if you
-> want the current state.** v1 (Phases 2-3, below) is the baseline record: it
-> produced archives full of policies that *fall over*, because falling was
-> priced rather than forbidden. v2 makes not-falling a feasibility constraint,
-> fixes the physics the fall was measured under, and starts the search from the
-> PPO walker. Everything below v1's Results section still describes machinery
-> v2 uses unchanged.
+> **Read [Walking v3](#walking-v3--a-descriptor-this-robot-can-move-in-and-a-gate-that-matches-the-bar)
+> first if you want the current state.** v1 (Phases 2-3, below) is the baseline
+> record: archives full of policies that *fall over*, because falling was priced
+> rather than forbidden. v2 makes not-falling a feasibility constraint, fixes
+> the physics the fall was measured under, and starts the search from the PPO
+> walker — and ends with two measurements that v3 acts on. Everything below
+> v1's Results section still describes machinery v2 and v3 use unchanged.
 
 ```
 qd/
-├── common.py          fitness + behaviour descriptor + archive/plot/checkpoint helpers
+├── common.py          fitness + archive/plot/checkpoint helpers
+├── descriptors.py     v3: the candidate behaviour axes, and which two an archive uses
+├── select_descriptor.py  v3: pick the axes by measurement, not by taste
 ├── cpg_genome.py      Phase 2 genome: 31-parameter open-loop CPG
 ├── evaluate.py        batched mjlab rollout harness: genomes -> (fitness, descriptor)
 ├── run_map_elites.py  Phase 2 CLI: pyribs GridArchive + GaussianEmitter ask/tell loop
@@ -188,16 +191,27 @@ stays up beats a ballistic dive that covers the same ground and lies there.
 It is also rate-limited by construction — there is no state you can reach early
 and then farm (AGENTS.md, "No jackpots").
 
-### Behaviour descriptor — per-foot duty factor (2-D, 20×20)
+### Behaviour descriptor — two axes out of a catalogue (2-D, 20×20)
 
-`(left_foot_duty_factor, right_foot_duty_factor)`, each the fraction of control
-steps that foot was in ground contact, from the same `feet_ground_contact`
-sensor the velocity task uses (left slot first, right second). Cully et al.'s
-hexapod descriptor, generalized to a biped.
+`qd/descriptors.py` holds nineteen candidate axes — contact statistics, posture,
+motion, actuator effort — and one accumulator that folds a batched rollout into
+all of them at once. `DescriptorCfg` names the two an archive is binned on plus
+their grid ranges, and every checkpoint records that choice, so verification,
+replay, rendering and the viewer all measure an archive on the axes it was
+*built* on.
 
-Steps after a fall are excluded from the average — otherwise a robot lying on
+The default is **per-foot duty factor** — `(left, right)`, each the fraction of
+control steps that foot was in ground contact, from the same
+`feet_ground_contact` sensor the velocity task uses. Cully et al.'s hexapod
+descriptor, generalized to a biped; it is what v1 and v2 ran on, and a v1/v2
+checkpoint that names no descriptor comes back as this one rather than being
+silently re-binned. Walking-v3 runs on
+[measured axes instead](#stage-a--choosing-the-axes-by-measurement).
+
+Steps after a fall are excluded from **every** axis — otherwise a robot lying on
 its face with both soles touching would report duty `(1, 1)` and squat in that
-corner of the archive.
+corner of the archive, and the same trick is available to every axis added
+since.
 
 ### Reproducibility
 
@@ -238,8 +252,8 @@ the GPU, not raising `--num-envs`.
 
 ## Tests
 
-`tests/test_qd_cpg_genome.py` and `tests/test_qd_common.py` are CPU-only and
-run with the rest of the suite:
+`tests/test_qd_cpg_genome.py`, `tests/test_qd_common.py` and
+`tests/test_qd_descriptors.py` are CPU-only and run with the rest of the suite:
 
 ```bash
 uv run --with pytest pytest tests/ -q
@@ -250,6 +264,14 @@ against the actual model in the documented servo order (`Entity.joint_names`
 interleaves neck/head between the legs, so a hard-coded `0..9` slice grabs the
 head), the two-layer bound enforcement, the fall latch, and the descriptor
 staying inside `[0, 1]²` where the `GridArchive` can see it.
+
+`test_qd_descriptors.py` locks the v3 axes the same way: the arithmetic of each
+one against a hand-computable rollout (including the touchdown edge detection
+step frequency and stride length are built on), that a missing input channel
+reads NaN rather than zero, that nothing after the fall-detection frame reaches
+any axis, and that a descriptor round-trips through a checkpoint's `meta` — the
+last of which is what stops an old archive being verified on axes it was never
+binned on.
 
 ## Results — v1
 
@@ -1120,6 +1142,152 @@ of them are inserted, but they are precisely the falling-over experience the
 critic needs in its buffer to learn what not to do.
 
 
+## Walking v3 — a descriptor this robot can move in, and a gate that matches the bar
+
+v2 ended with two measurements and one honest failure. The measurements:
+per-foot duty factor is nearly constant across everything this robot can do
+while upright, and a 2-replica insertion gate is a much weaker filter than an
+8-replica verification. The failure: an archive that was 100% survivors by
+construction and **8%** by verification, holding **5** robust elites in **5**
+cells.
+
+v3 changes exactly those two things, and they turn out to be one idea.
+
+### Stage A — choosing the axes by measurement
+
+The question v2 never asked costs about ten minutes:
+
+> does this axis separate gaits we already know are different, by more than one
+> genome's own replica noise — and can the search *move* along it?
+
+`qd/select_descriptor.py` asks it of all nineteen candidate axes in
+`qd/descriptors.py`, on a fixed **measurement set** of gaits that are known to
+be distinct and known to be robust: the six PPO teacher gaits distilled by
+`qd.seed` (twist commands spanning a 6x range in how far the teacher travels)
+and the five j003 elites that survived 7-of-8 verification. Sixty-four
+byte-identical replicas each, 704 rollouts, and a fallen replica is dropped —
+a truncated episode is not a measurement of a gait.
+
+Three numbers per axis:
+
+* **between-gait spread** — the range of the eleven gaits' *median* values. How
+  much of the axis real, feasible, structurally different gaits actually use.
+* **within-genome replica noise** — the mean across gaits of one genome's
+  standard deviation over its replicas. What MuJoCo-Warp's contact-solve order
+  moves the axis by, with the genome held byte-identical.
+* **mutation reach** — mutate the whole measurement set with the run's own GA
+  operator (iso+lineDD at the tuned sigmas), keep the 909 of 1024 offspring
+  that stay upright, and measure how far the axis travels among them, in units
+  of its own replica noise. This is the half v2 got wrong twice over: duty
+  factor neither separated gaits *nor* moved under mutation, and the second
+  failure is why the archive stalled at 15 elites.
+
+The full table is in `qd/measurements/descriptor_selection.md`; the axes that
+cleared both thresholds (replica sd under 10% of the axis's measured range,
+spread-to-noise at least 3):
+
+| axis | between-gait spread | replica sd | sd / range | spread / sd | \|corr\| with displacement | mutation reach (replica sds) |
+| --- | --- | --- | --- | --- | --- | --- |
+| mean \|joint velocity\| [rad/s] | 0.889 | 0.0748 | 5.6% | 11.9 | 0.93 | 13.3 |
+| cost of transport | 4.97 | 0.435 | 3.8% | 11.4 | 0.72 | 13.3 |
+| actuator power [W] | 2.40 | 0.225 | 5.4% | 10.7 | 0.90 | 12.4 |
+| mean \|yaw rate\| [rad/s] | 0.791 | 0.0833 | 6.9% | 9.5 | 0.87 | 10.6 |
+| stride length [m/step] | 0.0563 | 0.0062 | 8.0% | 9.0 | **1.00** | 9.5 |
+| **mean trunk height [m]** | **0.00278** | **0.00032** | **7.4%** | **8.7** | **0.61** | **11.7** |
+| right-foot duty factor | 0.117 | 0.0145 | 7.7% | 8.1 | 0.82 | 8.1 |
+| trunk-height oscillation [m] | 0.00148 | 0.00028 | 8.9% | 5.2 | 0.83 | 7.4 |
+| *left-foot duty factor* | *0.070* | *0.0156* | *11.4%* | *4.5* | *0.66* | *5.5* |
+| *step frequency [Hz]* | *0.571* | *0.270* | *7.9%* | *2.1* | *0.58* | *4.9* |
+| *mean forward lean* | *0.0302* | *0.0377* | *14.4%* | *0.8* | *0.27* | *3.5* |
+
+**Chosen: mean trunk height x mean |joint velocity|** — *how crouched it walks*
+by *how fast its limbs move* — on a 20x20 grid over
+
+| axis | range | why this range |
+| --- | --- | --- |
+| mean trunk height | **[0.11667, 0.12184] m** | measurement-set extremes, padded 10% |
+| mean \|joint velocity\| | **[0.89228, 2.50831] rad/s** | same |
+
+Against v2's descriptor, on the same eleven gaits and the same 20x20 grid:
+
+| | duty factor (v2) | trunk height x limb speed (v3) |
+| --- | --- | --- |
+| the 11 known gaits occupy | **4 cells** | **10 cells** |
+| the 6 teacher gaits occupy | **1 cell** | **6 cells** |
+| cells reachable by feasible GA mutants | — | **201 of 400** |
+| marginal bins filled by feasible mutants | — | 20/20 and 19/20 |
+
+#### The axis that topped the ranking and was rejected anyway
+
+`stride_length x torso_height_mean` scored best on every raw column — 230 cells
+reached, 11 of 11 gaits separated — and it is not the descriptor. Stride length
+here is planar displacement divided by the touchdown count, and the touchdown
+count barely varies across the whole measurement set (step frequency spans
+4.57-5.14 Hz). So stride length is the objective rescaled: its correlation with
+displacement is **1.00**. One of the archive's two axes would *be* fitness,
+MAP-Elites would fill it trivially, and "coverage" would degenerate into a
+histogram of distances. An axis has to be a property of *how* the robot walks,
+not a restatement of how far.
+
+#### What the chosen pair costs, stated plainly
+
+Limb speed correlates with displacement at **0.93** and trunk height at 0.61,
+so the high-limb-speed half of the archive partially mirrors the fitness
+ladder: fast cells hold fast walkers largely because moving faster requires
+moving the limbs faster. That is a real cost of this pair and it is visible in
+the table above. It was accepted because every more-independent alternative
+failed somewhere worse — cost of transport (|corr| 0.72, and the most
+independent of trunk height at 0.18) is ~1/distance, heavy-tailed, and on a
+linear 20-bin grid the feasible mutants pile 53% of themselves into one bin;
+step frequency and forward lean fail the noise threshold outright. Trunk height,
+the axis that carries the *behavioural* half of the pair, is the least
+fitness-correlated axis that passed.
+
+### Stage B — the gate matches the bar
+
+`--insertion-replicas 8`, unanimous survival, median fitness. Same rule v2
+introduced at N=2, run at the N the verification actually uses. The reasoning
+v2 wrote down and did not act on: a candidate that survives 2 of 2 still has a
+95% interval on its true survival rate reaching down to ~0.22, so the archive
+fills with policies that pass the gate and fail the bar.
+
+**The two halves of v3 are the same idea.** The chosen axes are fine-grained —
+0.26 mm bins on trunk height against a 0.52 mm single-rollout standard
+deviation — so a *single* rollout's descriptor jitters about two bins, and the
+median over the eight insertion replicas is what makes a cell mean anything.
+The gate stabilises the geography as well as the fitness, and this descriptor
+would have been a bad choice under v2's rule.
+
+### Reproduction
+
+```bash
+# Stage A — the descriptor table (~10 min, writes selection.md/.json)
+uv run python -m qd.select_descriptor \
+    --seeds logs/qd/seeds/ppo_seeds.npz \
+    --elites qd-run-archives/j003/qd/pga_me_v2_reeval/archive_final_verified.npz \
+    --replicas 64 --mutation-probe 1024 --out logs/qd/descriptor_selection
+
+# Stage B — 50 iterations x 1024 offspring x 8 replicas = 426,392 evaluations
+uv run python -m qd.pga.run_pga_me --iterations 50 --batch-size 1024 \
+    --initial-solutions 1024 --seed-genome logs/qd/seeds/ppo_seeds.npz \
+    --seeding.jitter-count 240 --insertion-replicas 8 \
+    --td3.replay-buffer-size 2000000 \
+    --descriptor.axis-x torso_height_mean --descriptor.x-range 0.11667 0.12184 \
+    --descriptor.axis-y joint_speed --descriptor.y-range 0.89228 2.50831 \
+    --budget-checkpoint-evals 207049 --out-dir logs/qd/pga_me_v3
+
+# the honest numbers: fresh replicas, independent of insertion
+uv run python -m qd.verify_archive --archive logs/qd/pga_me_v3/archive_final.npz
+uv run python -m qd.verify_archive --archive logs/qd/pga_me_v3/archive_budget.npz
+```
+
+`--budget-checkpoint-evals 207049` snapshots the archive the moment the run
+passes j003's evaluation count, so the v2-vs-v3 comparison can be read both at
+equal cost and at full budget. Measured on an RTX 3060: iteration 0 (seed block
+plus random initialisation, 16 rollouts) 288 s, then **145 s per iteration** —
+**2.1 h** for 2.06x j003's evaluations, because eight replicas of one batch
+amortise better than eight separate generations.
+
 ## Watching the gaits
 
 ```bash
@@ -1219,13 +1387,16 @@ runs used, or the QD-scores are not comparable.
   where two thirds of offspring fall immediately that is a large fraction.
   Higher N, or a per-cell running mean that accumulates evidence across an
   elite's whole lineage, are the other directions.
-* **A descriptor this robot can actually move in.** Per-foot duty factor is
-  nearly invariant across everything the robot can do without falling: six
-  teacher commands spanning a 0.41 m to 2.42 m stride all distil to duty
-  factors within 0.03 of each other, and 256 identical replicas of one genome
-  spread only 0.014. Stride length, lateral drift, energy or a turning rate
-  would all vary more, and a QD archive is only as interesting as the axes it
-  is binned on.
+* ~~A descriptor this robot can actually move in.~~ **Built** — see
+  [Walking v3](#stage-a--choosing-the-axes-by-measurement). The prediction that
+  "stride length, lateral drift, energy or a turning rate would all vary more"
+  was half right: energy, limb speed, turning rate and trunk height all beat
+  duty factor by a wide margin, lateral drift failed the noise threshold, and
+  stride length turned out to be the *objective* in disguise (|corr| 1.00 with
+  displacement) and was rejected for it. What remains open is a **log-scaled or
+  non-uniform axis**: cost of transport is the most objective-independent
+  quantity measured here and was passed over only because it is ~1/distance and
+  piles 53% of feasible mutants into one bin of a linear grid.
 * **A descriptor-aware PG operator.** PG variation currently ascends Q, which
   knows nothing about the behaviour descriptor, so it improves elites in place
   instead of moving them to new cells. A critic conditioned on a target

@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 import tyro
 
+from qd.descriptors import DescriptorCfg
 from qd.common import FitnessCfg, load_archive
 
 
@@ -87,7 +88,9 @@ def _select(data: dict, top: int) -> np.ndarray:
     return order[:top] if top else order
 
 
-def _rollout_with_qpos(args: Args, batch: np.ndarray, kind: str):
+def _rollout_with_qpos(
+    args: Args, batch: np.ndarray, kind: str, descriptor: DescriptorCfg | None = None
+):
     """Roll a batch out and return ``(qpos, alive, fitness, measures, info, mj_model)``.
 
     ``qpos`` is ``(T, N, nq)`` and ``alive`` the matching ``(T, N)`` mask of
@@ -97,6 +100,7 @@ def _rollout_with_qpos(args: Args, batch: np.ndarray, kind: str):
     """
     import torch
 
+    descriptor = descriptor or DescriptorCfg()
     frames: list[np.ndarray] = []
     alive_frames: list[np.ndarray] = []
 
@@ -119,8 +123,10 @@ def _rollout_with_qpos(args: Args, batch: np.ndarray, kind: str):
                 num_envs=len(batch),
                 device=args.device,
                 full_collision=args.full_collision,
+                full_gait_stats=True,
             ),
             args.fitness,
+            descriptor,
         )
         sim = harness.sim
         evaluator = CpgEvaluator(harness)
@@ -136,8 +142,10 @@ def _rollout_with_qpos(args: Args, batch: np.ndarray, kind: str):
                 num_envs=len(batch),
                 device=args.device,
                 full_collision=args.full_collision,
+                full_gait_stats=True,
             ),
             args.fitness,
+            descriptor=descriptor,
         )
         sim = harness.env.sim
         genomes = torch.as_tensor(batch, dtype=torch.float32, device=args.device)
@@ -195,6 +203,9 @@ def main(args: Args | None = None) -> None:
         kind = "cpg" if data["solution"].shape[1] < 100 else "mlp"
 
     rows = _select(data, args.top)
+    # The axes this archive was *built* on. A v1/v2 checkpoint carries no such
+    # key and comes back as duty factor, which is what it was binned on.
+    descriptor = DescriptorCfg.from_meta(data.get("meta"))
     dims = tuple(int(x) for x in data["grid_dims"])
     clips_dir = args.out / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
@@ -208,7 +219,7 @@ def main(args: Args | None = None) -> None:
         chunk = rows[start : start + args.max_envs]
         batch = data["solution"][chunk]
         qpos, alive, fitness, measures, info, mj_model = _rollout_with_qpos(
-            args, batch, kind
+            args, batch, kind, descriptor
         )
         trunk_body = mujoco.mj_name2id(
             mj_model, mujoco.mjtObj.mjOBJ_BODY, "robot/trunk_base"
@@ -236,8 +247,14 @@ def main(args: Args | None = None) -> None:
                     "archived_fitness": float(data["objective"][row]),
                     "replay_fitness": float(fitness[i]),
                     "displacement_m": float(info["displacement"][i]),
-                    "duty_left": float(measures[i, 0]),
-                    "duty_right": float(measures[i, 1]),
+                    # The archive's own two axes, whatever they are...
+                    "measure_x": float(measures[i, 0]),
+                    "measure_y": float(measures[i, 1]),
+                    # ...and duty factor regardless, so a v3 clip still reports
+                    # the quantity every earlier archive was indexed by and the
+                    # viewer can compare a v2 gait with a v3 one on it.
+                    "duty_left": float(info["axis/duty_left"][i]),
+                    "duty_right": float(info["axis/duty_right"][i]),
                     "upright_s": float(info["alive_steps"][i] * 0.02),
                     "survived": bool(~info["fell"][i]),
                 }
@@ -249,6 +266,11 @@ def main(args: Args | None = None) -> None:
         "archive": str(args.archive),
         "genome": kind,
         "grid_dims": list(dims),
+        "descriptor": {
+            "axes": list(descriptor.names),
+            "labels": list(descriptor.labels),
+            "ranges": [list(r) for r in descriptor.ranges],
+        },
         "episode_seconds": args.fitness.episode_seconds,
         "fps": fps,
         "resolution": [args.width, args.height],

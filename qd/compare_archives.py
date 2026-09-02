@@ -36,7 +36,8 @@ from pathlib import Path
 import numpy as np
 import tyro
 
-from qd.common import MEASURE_NAMES, FitnessCfg, load_archive, write_json
+from qd.common import FitnessCfg, load_archive, write_json
+from qd.descriptors import DescriptorCfg
 from qd.replay import infer_kind, reevaluate
 
 
@@ -110,6 +111,7 @@ def _measure(data: dict, args: Args, label: str) -> dict:
         args.fitness,
         args.device,
         args.max_envs,
+        descriptor=DescriptorCfg.from_meta(data.get("meta")),
     )
     del measures
     if reps > 1:
@@ -178,6 +180,16 @@ def main(args: Args | None = None) -> None:
     a_data, b_data = load_archive(args.a), load_archive(args.b)
     if list(a_data["grid_dims"]) != list(b_data["grid_dims"]):
         raise ValueError("archives use different grids; they are not comparable")
+    desc_a = DescriptorCfg.from_meta(a_data.get("meta"))
+    desc_b = DescriptorCfg.from_meta(b_data.get("meta"))
+    if desc_a != desc_b:
+        raise ValueError(
+            f"archives are binned on different behaviour descriptors "
+            f"({desc_a.names} {desc_a.ranges} vs {desc_b.names} {desc_b.ranges}); "
+            "a cell-by-cell comparison of them would be meaningless. Compare "
+            "their verified elite counts and distances instead."
+        )
+    labels = desc_a.labels
 
     a = _measure(a_data, args, args.a_label)
     b = _measure(b_data, args, args.b_label)
@@ -189,12 +201,13 @@ def main(args: Args | None = None) -> None:
 
     vmin = float(np.nanmin([np.nanmin(grid_a), np.nanmin(grid_b)]))
     vmax = float(np.nanmax([np.nanmax(grid_a), np.nanmax(grid_b)]))
-    extent = (0.0, 1.0, 0.0, 1.0)
+    (x_lo, x_hi), (y_lo, y_hi) = desc_a.ranges
+    extent = (x_lo, x_hi, y_lo, y_hi)
 
     fig, axes = plt.subplots(1, 3, figsize=(16.5, 4.9), dpi=140)
     for ax, grid, s in ((axes[0], grid_a, a), (axes[1], grid_b, b)):
         im = ax.imshow(grid.T, origin="lower", extent=extent, vmin=vmin, vmax=vmax,
-                       cmap="viridis", aspect="equal")
+                       cmap="viridis", aspect="auto")
         surviving = (
             f"  survivors {s['surviving_elites']} "
             f"({s['surviving_coverage'] * 100:.1f}% of the grid)"
@@ -206,8 +219,8 @@ def main(args: Args | None = None) -> None:
             f"raw coverage {s['coverage'] * 100:.1f}%{surviving}\n"
             f"QD {s[basis + '_qd_score']:.0f}  best {s[basis + '_best']:+.3f} m"
         )
-        ax.set_xlabel(MEASURE_NAMES[0].replace("_", " "))
-        ax.set_ylabel(MEASURE_NAMES[1].replace("_", " "))
+        ax.set_xlabel(labels[0])
+        ax.set_ylabel(labels[1])
         fig.colorbar(im, ax=ax, label="fitness [m]")
 
     filled_a, filled_b = ~np.isnan(grid_a), ~np.isnan(grid_b)
@@ -216,13 +229,13 @@ def main(args: Args | None = None) -> None:
     )
     lim = float(np.nanmax(np.abs(diff))) if np.any(~np.isnan(diff)) else 1.0
     im = axes[2].imshow(diff.T, origin="lower", extent=extent, vmin=-lim, vmax=lim,
-                        cmap="RdBu_r", aspect="equal")
+                        cmap="RdBu_r", aspect="auto")
     only_b = int(np.sum(filled_b & ~filled_a))
     only_a = int(np.sum(filled_a & ~filled_b))
     axes[2].set_title(f"{b['label']} − {a['label']}\n"
                       f"{only_b} cells only in B, {only_a} only in A")
-    axes[2].set_xlabel(MEASURE_NAMES[0].replace("_", " "))
-    axes[2].set_ylabel(MEASURE_NAMES[1].replace("_", " "))
+    axes[2].set_xlabel(labels[0])
+    axes[2].set_ylabel(labels[1])
     fig.colorbar(im, ax=axes[2], label="fitness delta [m]")
     fig.tight_layout()
     fig.savefig(out / "comparison.png")

@@ -18,6 +18,7 @@ from __future__ import annotations
 import numpy as np
 
 from qd.common import FitnessCfg
+from qd.descriptors import DescriptorCfg
 
 
 def infer_kind(solutions: np.ndarray) -> str:
@@ -32,6 +33,8 @@ def reevaluate(
     device: str = "cuda:0",
     max_envs: int = 512,
     full_collision: bool = True,
+    descriptor: DescriptorCfg | None = None,
+    full_gait_stats: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict, float]:
     """Roll ``solutions`` out again.
 
@@ -44,7 +47,16 @@ def reevaluate(
     answers "was that survivor real, or was it standing on a floor it could
     sink into" — but it is not the physics that archive was searched under, so
     label such numbers as a re-measurement rather than as v1's result.
+
+    ``descriptor`` is the axis pair the returned ``measures`` are computed on.
+    Pass the one the archive was **built** with
+    (:meth:`qd.descriptors.DescriptorCfg.from_meta` recovers it from the
+    checkpoint), or a verification pass silently re-bins a v3 archive on v2's
+    duty factors. ``full_gait_stats`` additionally returns every candidate axis
+    in ``info`` under an ``axis/`` prefix, which is what
+    :mod:`qd.select_descriptor` measures its table from.
     """
+    descriptor = descriptor or DescriptorCfg()
     n = len(solutions)
     parts: list[tuple[np.ndarray, np.ndarray, dict]] = []
     control_dt = 0.02
@@ -59,8 +71,10 @@ def reevaluate(
                     num_envs=len(block),
                     device=device,
                     full_collision=full_collision,
+                    full_gait_stats=full_gait_stats,
                 ),
                 fitness,
+                descriptor,
             )
             f, m, info = CpgEvaluator(harness).evaluate(block)
             control_dt = harness.control_dt
@@ -74,8 +88,10 @@ def reevaluate(
                     num_envs=len(block),
                     device=device,
                     full_collision=full_collision,
+                    full_gait_stats=full_gait_stats,
                 ),
                 fitness,
+                descriptor=descriptor,
             )
             genomes = torch.as_tensor(block, dtype=torch.float32, device=device)
             f, m, info, _ = harness.rollout(genomes, collect=False)

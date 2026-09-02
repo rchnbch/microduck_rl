@@ -28,6 +28,7 @@ import torch
 
 from qd import cpg_genome
 from qd.common import FitnessCfg, RolloutMetrics
+from qd.descriptors import DescriptorCfg
 
 # Midpoint of microduck_constants' delay_min_lag=3 / delay_max_lag=6.
 FIXED_COMMAND_LAG: int = 4
@@ -74,6 +75,12 @@ class HarnessCfg:
 
     The rollout stops when nothing is upright any more. Not checked every step:
     ``alive.any()`` forces a host sync."""
+
+    full_gait_stats: bool = False
+    """Read the extra velocity / joint / actuator channels every step.
+
+    See :class:`qd.pga.evaluate.PolicyHarnessCfg.full_gait_stats`; off unless
+    the descriptor needs them or a measurement wants every candidate axis."""
 
     njmax: int = 128
     """Constraints allocated per world.
@@ -158,7 +165,12 @@ class MicroduckRolloutHarness:
     so the batch size cannot change afterwards.
     """
 
-    def __init__(self, cfg: HarnessCfg, fitness: FitnessCfg | None = None):
+    def __init__(
+        self,
+        cfg: HarnessCfg,
+        fitness: FitnessCfg | None = None,
+        descriptor: DescriptorCfg | None = None,
+    ):
         from mjlab.scene import Scene, SceneCfg
         from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
         from mjlab.terrains.terrain_entity import TerrainEntityCfg
@@ -190,6 +202,9 @@ class MicroduckRolloutHarness:
         self.sim.expand_model_fields(("dof_frictionloss", "dof_damping"))
         if self.scene.sensor_context is not None:
             self.sim.set_sensor_context(self.scene.sensor_context)
+
+        self.descriptor = descriptor or DescriptorCfg()
+        self._collect_extras = bool(cfg.full_gait_stats or self.descriptor.needs)
 
         self.robot = self.scene.entities["robot"]
         self.leg_joint_ids, leg_names = self.robot.find_joints(
@@ -276,6 +291,21 @@ class MicroduckRolloutHarness:
         assert found is not None
         return found.reshape(self.num_envs, -1)[:, :2] > 0
 
+    def gait_extras(self) -> dict[str, torch.Tensor] | None:
+        """Extra per-step channels for the candidate descriptor axes.
+
+        Mirrors :meth:`qd.pga.evaluate.PolicyRolloutHarness.gait_extras`, so a
+        CPG archive and an MLP archive can be binned on the same axes."""
+        if not self._collect_extras:
+            return None
+        d = self.robot.data
+        return {
+            "lin_vel_w": d.root_link_lin_vel_w,
+            "ang_vel_b": d.root_link_ang_vel_b,
+            "joint_vel": d.joint_vel,
+            "qfrc_actuator": d.qfrc_actuator,
+        }
+
     # -- generic rollout -------------------------------------------------- #
 
     def rollout(self, controller, recorder=None) -> tuple[np.ndarray, np.ndarray, dict]:
@@ -303,7 +333,14 @@ class MicroduckRolloutHarness:
             if recorder is not None:
                 recorder("settle", k, None)
 
-        metrics = RolloutMetrics(self.num_envs, fit, self.device, episode_steps)
+        metrics = RolloutMetrics(
+            self.num_envs,
+            fit,
+            self.device,
+            episode_steps,
+            descriptor=self.descriptor,
+            control_dt=self.control_dt,
+        )
         metrics.begin(self.base_pos())
         alive = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         for k in range(episode_steps):
@@ -311,7 +348,10 @@ class MicroduckRolloutHarness:
             self.step()
             was_alive = alive.clone()
             metrics.update(
-                self.base_pos(), self.projected_gravity(), self.foot_contact()
+                self.base_pos(),
+                self.projected_gravity(),
+                self.foot_contact(),
+                self.gait_extras(),
             )
             alive = ~metrics.fallen
             if recorder is not None:

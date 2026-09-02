@@ -378,6 +378,7 @@ class PolicyRolloutHarness:
         actor=None,
         on_step=None,
         mode_stats=None,
+        mode_reward=None,
     ) -> tuple[np.ndarray, np.ndarray, dict, Transitions | None]:
         """Evaluate one genome per world and optionally collect transitions.
 
@@ -437,6 +438,12 @@ class PolicyRolloutHarness:
             control_dt=self.control_dt,
         )
         metrics.begin(self.base_pos())
+        accel_reward = None
+        if mode_reward is not None:
+            from qd.modes import VerticalAccel
+
+            accel_reward = VerticalAccel(self.num_envs, self.device, self.control_dt)
+            accel_reward.begin(self.robot.data.root_link_lin_vel_w)
         accel = None
         if mode_stats is not None:
             from qd.modes import VerticalAccel
@@ -481,16 +488,29 @@ class PolicyRolloutHarness:
             just_fell = was_alive & ~alive
 
             if collect:
-                upright = torch.nan_to_num(-gravity[:, 2]).clamp(0.0, 1.0)
-                reward = (
-                    rc.vel_weight * torch.nan_to_num(self.forward_velocity())
-                    + rc.alive_bonus
-                    + rc.upright_weight * upright
-                ) * self.control_dt
-                steps_left = episode_steps - step - 1
-                reward = reward - just_fell.float() * (
-                    rc.fall_penalty * steps_left / episode_steps
-                )
+                if mode_reward is not None:
+                    # v4: progress minus impact. `ShapedRewardCfg`'s alive bonus
+                    # and upright term are a critic that thinks crawling is bad,
+                    # and PG variation would gradient-ascend every crawl toward
+                    # standing up. `az` is the same quantity P2''s impact clause
+                    # reads, so the critic and the gate agree about "violent".
+                    az = accel_reward.step(self.robot.data.root_link_lin_vel_w)
+                    reward = (
+                        mode_reward.vel_weight
+                        * torch.nan_to_num(self.forward_velocity())
+                        - mode_reward.impact_weight * torch.nan_to_num(az).abs()
+                    ) * self.control_dt
+                else:
+                    upright = torch.nan_to_num(-gravity[:, 2]).clamp(0.0, 1.0)
+                    reward = (
+                        rc.vel_weight * torch.nan_to_num(self.forward_velocity())
+                        + rc.alive_bonus
+                        + rc.upright_weight * upright
+                    ) * self.control_dt
+                    steps_left = episode_steps - step - 1
+                    reward = reward - just_fell.float() * (
+                        rc.fall_penalty * steps_left / episode_steps
+                    )
                 buf.append((obs, action, reward, next_obs, just_fell.float(), was_alive))
             obs = next_obs
             if recorder is not None:

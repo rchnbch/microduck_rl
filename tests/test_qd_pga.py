@@ -4,15 +4,22 @@ The acceptance criterion for Phase 3 is that *both* variation operators
 contribute archive insertions — a PG insertion rate near zero means the critic
 or the reward wiring is broken, not that the operator is unhelpful. These tests
 pin the wiring that would silently produce that: the genome's flat layout, the
-critic actually being differentiable through the flat genome, and the per-step
-reward summing to the same episodic objective the archive ranks on.
+critic actually being differentiable through the flat genome, and the shape of
+the per-step reward the critic is trained on.
+
+Walking-v2 adds the survival gate and the honest-physics switches to that list.
 """
 
 import numpy as np
 import pytest
 import torch
 from qd.common import FitnessCfg
-from qd.pga.evaluate import DR_EVENT_TERMS, KEEP_EVENT_TERMS, Transitions
+from qd.pga.evaluate import (
+    DR_EVENT_TERMS,
+    KEEP_EVENT_TERMS,
+    ShapedRewardCfg,
+    Transitions,
+)
 from qd.pga.policy_genome import PolicySpec
 from qd.pga.td3 import ReplayBuffer, Td3Cfg, Td3Trainer
 from qd.pga.variation import isoline_variation, pg_variation
@@ -242,23 +249,41 @@ def test_greedy_genome_is_a_detached_copy():
 # --------------------------------------------------------------------------- #
 
 
-def test_per_step_reward_sums_to_the_episodic_fitness():
-    """The critic must optimise exactly what the archive ranks on.
+def test_velocity_term_alone_still_sums_to_displacement():
+    """v1's identity, now scoped to the one term that still carries it.
 
-    Episodic fitness is ``displacement - fall_penalty * fraction_fallen``.
-    The rollout charges ``vx*dt`` while upright and a terminal
-    ``-fall_penalty * steps_left / total`` on the fall; those must agree.
+    Walking-v2 deliberately breaks the *whole* reward's equality with the
+    episodic objective — the critic gets alive and upright terms so it can
+    teach balance (see :class:`ShapedRewardCfg`). What must not drift is the
+    velocity term's meaning: at ``vel_weight`` 1.0 it is still literally
+    metres of forward progress, which is what keeps the critic on v1's scale
+    and the shaping weights interpretable as "metres per second of posture".
     """
-    fit = FitnessCfg(fall_penalty=0.25)
-    total_steps, fall_step = 350, 200
-    dt, vx = 0.02, 0.3
+    rc = ShapedRewardCfg()
+    assert rc.vel_weight == 1.0
+    dt, vx, steps = 0.02, 0.3, 200
+    assert sum(rc.vel_weight * vx * dt for _ in range(steps)) == pytest.approx(
+        vx * dt * steps, abs=1e-9
+    )
 
-    displacement = vx * dt * fall_step
-    episodic = displacement - fit.fall_penalty * (1 - fall_step / total_steps)
 
-    per_step = sum(vx * dt for _ in range(fall_step))
-    per_step -= fit.fall_penalty * (total_steps - fall_step) / total_steps
-    assert per_step == pytest.approx(episodic, abs=1e-9)
+def test_shaped_reward_prices_survival_above_a_dive():
+    """A policy that dives must not out-earn one that stands still.
+
+    v1's failure in one inequality. Its numbers: a diver that covers 0.4 m and
+    falls at 2 s of a 7 s episode scored 0.4 - 0.25*(5/7) = +0.22, while a
+    policy that stayed up and went nowhere scored 0.0. The dive won, and the
+    archive filled with divers. With the gate the diver is not inserted at
+    all; and the critic that guides PG variation now agrees, because the
+    terminal penalty is 4x larger and the alive/upright terms pay for the
+    5 s the diver spent on the floor.
+    """
+    rc = ShapedRewardCfg()
+    total, fall_step, dt = 350, 100, 0.02
+
+    diver = 0.4 - rc.fall_penalty * (total - fall_step) / total
+    stander = (rc.alive_bonus + rc.upright_weight * 1.0) * dt * total
+    assert diver < stander
 
 
 def test_every_velocity_event_term_is_classified():

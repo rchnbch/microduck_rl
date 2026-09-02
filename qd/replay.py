@@ -31,12 +31,19 @@ def reevaluate(
     fitness: FitnessCfg,
     device: str = "cuda:0",
     max_envs: int = 512,
+    full_collision: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, dict, float]:
     """Roll ``solutions`` out again.
 
     Returns ``(fitness, measures, info, control_dt)``. The batch is chunked to
     ``max_envs``; each chunk builds its own harness, because the CUDA graph pins
     the world count.
+
+    ``full_collision`` defaults to walking-v2's honest physics. Re-evaluating a
+    v1 archive with it on is a *fair* thing to do and an informative one — it
+    answers "was that survivor real, or was it standing on a floor it could
+    sink into" — but it is not the physics that archive was searched under, so
+    label such numbers as a re-measurement rather than as v1's result.
     """
     n = len(solutions)
     parts: list[tuple[np.ndarray, np.ndarray, dict]] = []
@@ -48,7 +55,12 @@ def reevaluate(
             from qd.evaluate import CpgEvaluator, HarnessCfg, MicroduckRolloutHarness
 
             harness = MicroduckRolloutHarness(
-                HarnessCfg(num_envs=len(block), device=device), fitness
+                HarnessCfg(
+                    num_envs=len(block),
+                    device=device,
+                    full_collision=full_collision,
+                ),
+                fitness,
             )
             f, m, info = CpgEvaluator(harness).evaluate(block)
             control_dt = harness.control_dt
@@ -58,7 +70,12 @@ def reevaluate(
             from qd.pga.evaluate import PolicyHarnessCfg, PolicyRolloutHarness
 
             harness = PolicyRolloutHarness(
-                PolicyHarnessCfg(num_envs=len(block), device=device), fitness
+                PolicyHarnessCfg(
+                    num_envs=len(block),
+                    device=device,
+                    full_collision=full_collision,
+                ),
+                fitness,
             )
             genomes = torch.as_tensor(block, dtype=torch.float32, device=device)
             f, m, info, _ = harness.rollout(genomes, collect=False)

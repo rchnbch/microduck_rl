@@ -38,12 +38,50 @@ class Td3Cfg:
     noise_clip: float = 0.5
     critic_hidden: tuple[int, ...] = (256, 256)
     critic_learning_rate: float = 3e-4
-    greedy_learning_rate: float = 3e-4
-    policy_learning_rate: float = 1e-3
-    """Learning rate for PG variation of *offspring* (QDax uses a larger one
-    here than for the greedy actor)."""
+
+    # --- policy-side step sizes: NOT QDax's, and the reason is measured ----- #
+    # QDax's 100 offspring steps at 1e-3 and 300 greedy steps at 3e-4 are tuned
+    # for a search that starts from random policies, where a large move costs
+    # nothing because there is nothing yet to break. Walking-v2 starts from a
+    # distilled PPO walker and only inserts full-episode survivors, and Adam's
+    # per-parameter step is bounded by the learning rate, so `steps * lr` is a
+    # budget on how far the genome travels — against an initial weight scale of
+    # ~1/sqrt(61) = 0.13. `qd.pga.tune_pg` measures where that budget stops
+    # being survivable (40 offspring per cell, one trained critic, parents
+    # feasible 40% of the time):
+    #
+    #   steps  lr      |dgenome|   offspring feasible
+    #       5  3e-5    1.1e-4      48%
+    #      30  3e-5    6.3e-4      55%
+    #      10  3e-4    2.1e-3      40%
+    #      30  1e-4    2.1e-3      52%
+    #      30  3e-4    5.8e-3       0%   <- QDax-scale move, total collapse
+    #     100  1e-3    2.9e-2       0%   <- QDax's actual default
+    #
+    # Feasibility holds to ~2e-3 of mean per-weight drift and collapses by
+    # ~6e-3. The defaults below sit at 6.3e-4, comfortably inside the safe
+    # region and still moving the genome ~5x further than the GA's iso term.
+    greedy_learning_rate: float = 1e-6
+    """The greedy actor takes ~150 updates *per iteration* (``num_critic_
+    training_steps / policy_delay``), so its budget is 150x an offspring's and
+    it needs a correspondingly smaller rate. Measured over 8 validation
+    iterations, as ``greedy_survival_fraction`` per iteration:
+
+        3e-4 (QDax)   1.00 0.06 ...           destroyed inside one iteration
+        1e-5          1.00 1.00 0.20 0.16 ... gone by iteration 3
+        1e-6          1.00 1.00 1.00 1.00 ... upright throughout
+
+    This matters well beyond the greedy actor's own insertions, because TD3
+    bootstraps its target off ``greedy_target``: a fallen greedy actor teaches
+    a critic whose Q surface is about falling, and PG variation then ascends
+    every elite toward it. Offspring feasibility rose from ~45% to ~58% on the
+    move from 1e-5 to 1e-6."""
+
+    policy_learning_rate: float = 3e-5
+    """Learning rate for PG variation of *offspring*."""
+
     num_critic_training_steps: int = 300
-    num_pg_training_steps: int = 100
+    num_pg_training_steps: int = 30
 
 
 class ReplayBuffer:
@@ -160,6 +198,29 @@ class Td3Trainer:
         self.greedy_target = self.greedy.detach().clone()
         self.greedy_opt = torch.optim.Adam([self.greedy], lr=cfg.greedy_learning_rate)
         self._updates = 0
+
+    def set_greedy(self, genome: torch.Tensor) -> None:
+        """Start the greedy actor from ``genome`` instead of a random init.
+
+        Walking-v2 hands it the distilled PPO walker, and that is not a
+        cosmetic head start. The TD3 target is
+        ``r + gamma * Q_target(s', greedy_target(s'))``: the critic learns the
+        value of *the greedy actor's* behaviour. Bootstrapping off a policy
+        that face-plants at 1.3 s teaches a critic whose Q surface is about
+        falling, and PG variation then gradient-ascends every elite toward
+        that — measured in the v2 validation run as a PG feasibility rate of
+        0.0% against GA's 40%. Starting the greedy actor on a walker points
+        the whole gradient half of the algorithm at states a survivor can
+        actually reach.
+        """
+        with torch.no_grad():
+            self.greedy.copy_(genome.reshape(1, -1).to(self.greedy.device))
+        self.greedy_target = self.greedy.detach().clone()
+        # Adam's moments were accumulated for the old parameters; keeping them
+        # would apply the previous actor's momentum to this one.
+        self.greedy_opt = torch.optim.Adam(
+            [self.greedy], lr=self.cfg.greedy_learning_rate
+        )
 
     # -- training ------------------------------------------------------------ #
 

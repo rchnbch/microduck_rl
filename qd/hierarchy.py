@@ -264,7 +264,7 @@ class ModeArchives:
                 pool.append((mode, int(idx), np.asarray(sol)))
         if not pool:
             return []
-        k = max(1, int(round(fraction * len(pool))))
+        k = max(1, round(fraction * len(pool)))
         pick = rng.choice(len(pool), size=min(k, len(pool)), replace=False)
         return [pool[i] for i in pick]
 

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-
 from qd.hierarchy import (
     V3_WALK_DESCRIPTOR,
     ModeArchiveCfg,

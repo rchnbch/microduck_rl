@@ -75,6 +75,18 @@ class HarnessCfg:
     The rollout stops when nothing is upright any more. Not checked every step:
     ``alive.any()`` forces a host sync."""
 
+    njmax: int = 128
+    """Constraints allocated per world.
+
+    mjlab's heuristic is sized for the foot-only model and overflows once every
+    shell can touch the ground: a robot lying on its side under
+    ``full_collision`` produced ``nefc overflow - please increase njmax to 91``
+    from ``qd.check_harness``, and an overflow silently *drops* constraints —
+    i.e. quietly makes the floor soft again, which is the exact bug
+    ``full_collision`` exists to fix. 128 clears the worst observed frame with
+    headroom. (The Phase-3 harness runs through ``ManagerBasedRlEnv``, which
+    sizes this itself and never overflowed; this is the low-level path.)"""
+
     @property
     def control_dt(self) -> float:
         return self.physics_dt * self.decimation
@@ -163,7 +175,9 @@ class MicroduckRolloutHarness:
         self.scene = Scene(scene_cfg, device=cfg.device)
         self.sim = Simulation(
             num_envs=cfg.num_envs,
-            cfg=SimulationCfg(mujoco=MujocoCfg(timestep=cfg.physics_dt)),
+            cfg=SimulationCfg(
+                mujoco=MujocoCfg(timestep=cfg.physics_dt), njmax=cfg.njmax
+            ),
             model=self.scene.compile(),
             device=cfg.device,
         )

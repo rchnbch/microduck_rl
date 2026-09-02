@@ -38,6 +38,11 @@ def test_honest_physics_is_the_default_on_both_harnesses():
     # The fall check has to actually run, and not on every step (host sync).
     assert HarnessCfg().fall_check_every > 1
     assert PolicyHarnessCfg().fall_check_every > 1
+    # Full collision means more contacts, and mjlab's default constraint
+    # allocation overflows on a robot lying on its side. An overflow silently
+    # drops constraints — it makes the floor soft again, which is the exact bug
+    # full_collision exists to fix — so the low-level harness pins its own.
+    assert HarnessCfg().njmax >= 100
 
 
 def test_full_collision_selects_the_all_collisions_model():

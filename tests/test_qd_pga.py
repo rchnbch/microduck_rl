@@ -13,7 +13,6 @@ Walking-v2 adds the survival gate and the honest-physics switches to that list.
 import numpy as np
 import pytest
 import torch
-from qd.common import FitnessCfg
 from qd.pga.evaluate import (
     DR_EVENT_TERMS,
     KEEP_EVENT_TERMS,

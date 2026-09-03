@@ -38,6 +38,7 @@ Run::
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -96,6 +97,9 @@ class Args:
     random_mlps: int = 1024
 
     episode_seconds: float = 7.0
+    refresh: bool = False
+    """Recompute every stage even if its cache is on disk."""
+
     skip_genomes: bool = False
     """Scripted probes only — much faster, and enough for sections 1-4."""
 
@@ -117,6 +121,69 @@ class ProbeResult:
     """Keyed by window length: P2' has to be re-accumulated per (W, stride)."""
 
     displacement: np.ndarray
+
+
+def save_results(results: list[ProbeResult], path: Path) -> Path:
+    """Cache one stage's features so a crash cannot cost the whole sweep.
+
+    Stage A' is ~300 batched rollouts and the first attempt died *after* the
+    last one, tidying up a harness. Each stage now writes its own ``.npz`` and
+    a rerun skips what is already on disk — which also makes the sweep cheap to
+    re-analyse when a threshold moves.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, np.ndarray] = {}
+    meta = []
+    for i, r in enumerate(results):
+        meta.append(
+            {
+                "name": r.name,
+                "intended_mode": r.intended_mode,
+                "positive": r.positive,
+                "source": r.source,
+                "windows": sorted(r.features),
+            }
+        )
+        for w, feats in r.features.items():
+            for field_name in ModeFeatures.PER_WINDOW + ModeFeatures.PER_EPISODE:
+                payload[f"{i}|{w:g}|{field_name}"] = getattr(feats, field_name)
+    payload["meta_json"] = np.array(json.dumps(meta))
+    np.savez_compressed(path, **payload)
+    return path
+
+
+def load_results(path: Path) -> list[ProbeResult]:
+    with np.load(path, allow_pickle=False) as f:
+        meta = json.loads(str(f["meta_json"]))
+        out = []
+        for i, m in enumerate(meta):
+            features = {}
+            for w in m["windows"]:
+                kwargs = {
+                    name: f[f"{i}|{w:g}|{name}"]
+                    for name in ModeFeatures.PER_WINDOW + ModeFeatures.PER_EPISODE
+                }
+                features[float(w)] = ModeFeatures(**kwargs)
+            out.append(
+                ProbeResult(
+                    m["name"], m["intended_mode"], bool(m["positive"]), m["source"],
+                    features, features[2.0].displacement,
+                )
+            )
+    return out
+
+
+def cached(name: str, args: Args, build) -> list[ProbeResult]:
+    """Run ``build`` unless its cache is already on disk."""
+    path = Path(args.out) / f"features_{name}.npz"
+    if path.exists() and not args.refresh:
+        print(f"   [{name}] reusing {path}", flush=True)
+        return load_results(path)
+    results = build(args)
+    if results:
+        save_results(results, path)
+        print(f"   [{name}] cached {len(results)} results -> {path}", flush=True)
+    return results
 
 
 def _window_cfgs(episode_seconds: float, control_dt: float) -> dict[float, WindowCfg]:
@@ -566,10 +633,10 @@ def main(args: Args | None = None) -> None:
     args = args or tyro.cli(Args)
     classifier = ClassifierCfg()
 
-    results = scripted_results(args)
+    results = cached("scripted", args, scripted_results)
     if not args.skip_genomes:
-        results += genome_results(args)
-        results += cpg_negative_results(args)
+        results += cached("genomes", args, genome_results)
+        results += cached("cpg", args, cpg_negative_results)
 
     sweep = predicate_sweep(results, classifier)
     chosen = choose_setting(sweep)

@@ -368,6 +368,15 @@ class PolicyRolloutHarness:
             head_columns=head,
         )
 
+    def close(self) -> None:
+        """Drop the env so a second harness can be built in the same process.
+
+        Mirrors :meth:`qd.evaluate.MicroduckRolloutHarness.close`. Its absence
+        cost an hour of Stage A': the measurement ran to completion and then
+        died tidying up."""
+        self.env = None  # type: ignore[assignment]
+        self.robot = None  # type: ignore[assignment]
+
     # -- rollout ------------------------------------------------------------- #
 
     def rollout(

@@ -1770,12 +1770,24 @@ action at the phase the student has *reached* — cut the student-state loss
 
 #### What it produced, and the negative results next to it
 
-Pure behaviour cloning without DAgger is **worse** (all five ~0 viable), so the
-rounds do help. The phase-tracking lag calibration, on the other hand, aliases
-badly — 27, 70, 122, 127, 148-170 control steps across runs, longer than the
-gait's own period — so that machinery is not earning its place even though the
-diagnosis behind it was sound. Both are recorded because a future attempt will
-be tempted by each.
+**One seed of five survives**: `v1_cpg_277` distils to 0.758 per-replica P2'
+viability at +0.246 m, unanimously labelled crawl, which the 5-of-8 insertion
+gate admits about 90 % of the time. Thin, and real.
+
+The DAgger-round count is **non-monotone**, which is worth knowing before
+reaching for more of them:
+
+| rounds | result |
+| --- | --- |
+| 1 (pure behaviour cloning) | all five ~0 viable |
+| **4** | **`v1_cpg_277` at 0.758**, rest 0 |
+| 8 | all five 0, *including* 277 |
+
+More rounds accumulate more bad labels in the bank, so the curve peaks and then
+falls. The phase-tracking lag calibration is the other thing not earning its
+place: it aliases badly — 27, 70, 122, 127, 148-170 control steps across runs,
+longer than the gait's own period — even though the diagnosis behind it was
+sound. Both are recorded because a future attempt will be tempted by each.
 
 **The generalisable version, for anyone distilling a teacher into a fixed
 policy class: check that the teacher's actions are inside the student's action

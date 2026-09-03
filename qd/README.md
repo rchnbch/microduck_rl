@@ -1685,6 +1685,103 @@ One more thing they show: the 8-replica estimate had all five at 1.000, and at
 128 replicas three of them fell to 0.46-0.86. Small-sample optimism, the v3
 lesson, visible again in the measurement built to avoid it.
 
+### 2. Seeding a mode you cannot command: the reachability trap
+
+The design's Q3 routes crawl seeding through a new prone-locomotion PPO task,
+on the reasoning that a scripted probe cannot be an archive candidate — no
+open-loop posture survives a standing start here, so a probe must spawn prone
+while the archive spawns standing. Stage A' found an exception nobody had
+looked for: **five elites in v1's MAP-Elites CPG archive spawn standing, get
+themselves down, and crawl.** They had been filed as junk since j002 because
+the upright gate called them fallen. That is a crawl seed for the price of a
+distillation instead of a training run.
+
+Distilling them took four attempts, and the first three failures are worth
+more than the success, because each produced a log that looked fine.
+
+#### It is not a distillation problem. It is an action-space problem.
+
+The genome emits `tanh` and `JointPositionAction` runs at scale 1.0, so a
+genome can command **HOME +- 1 rad and nothing else**. The CPG's targets are
+bounded by the *soft joint limits*, which are wider. Measured over the five
+crawls:
+
+| genome | max \|delta from HOME\| | commands outside the genome's box |
+| --- | --- | --- |
+| `v1_cpg_175` | 1.93 rad (right ankle) | **15.2 %** |
+| `v1_cpg_277` | 1.92 rad (knees) | **24.1 %** |
+| `v1_cpg_169` | 1.83 rad (knees) | 20.7 % |
+| `v1_cpg_4` | 1.78 rad (knees) | 17.5 % |
+| `v1_cpg_6` | 1.57 rad (knees) | 21.5 % |
+
+A crawl folds its knees far past anything a walking-tuned action box allows.
+Distilling a teacher the student cannot command is not a hard optimisation
+problem, it is an impossible one — **and the symptom is the most misleading
+one available: near-perfect behaviour-cloning loss (0.0004-0.002) and a student
+that does not crawl.** Every diagnostic that looks at the loss says the
+distillation worked.
+
+The fix is to clip the teacher into the student's action space *first*, and
+then ask the honest question — is there still a crawl in there? For three of
+the five there is, and **two get better clipped**:
+
+| genome | free | clipped into the box |
+| --- | --- | --- |
+| `v1_cpg_4` | 0.500 | **1.000** |
+| `v1_cpg_169` | 0.891 | **0.992** |
+| `v1_cpg_277` | 1.000 | 0.953 |
+| `v1_cpg_175` | 1.000 | 0.000 |
+| `v1_cpg_6` | 0.422 | 0.000 |
+
+(per-replica P2' viability, 128 world-permuted replicas)
+
+Not a paradox: the clip caps the knee fold, and a less extreme gait is a more
+repeatable one.
+
+This also resolves a standoff between the two candidate teachers. The v1 CPG
+crawls have the **right spawn** (standing) and the **wrong action box**; the
+scripted probes have the right box — all five stay viable at 1.000 when
+clipped, losing ~10 % of their displacement — and the **wrong spawn** (prone).
+A *clipped* v1 crawl has both.
+
+#### DAgger needs an expert that can answer "given where you are"
+
+A CPG is a clock. It answers "at this time, do this" and cannot answer "given
+where you are, what would you do", which is precisely what DAgger asks of an
+expert on every round after the first. Once the student drifts out of phase,
+every label is wrong in a way more rounds cannot repair, because the labels
+themselves are mislabelled. Measured with the clock version: BC loss **0.0003
+on the teacher's states against 0.030 on the student's own**, a hundredfold gap
+that is the distribution shift made visible.
+
+Turning the clock into a state-conditioned expert — match the student's actual
+leg joint positions against the CPG's own target trajectory, label with the
+action at the phase the student has *reached* — cut the student-state loss
+19x, to 0.00157. Two details cost a run each:
+
+* **the tracker labels, it never drives.** The robot's joints lag the commanded
+  target, so a tracker allowed to drive compounds that lag into a slower gait:
+  the *teacher itself* went from +0.500 m to **-0.133 m**, turning the crawl
+  into a backwards shuffle;
+* **on round 0 the drive and the label are the same action.** Querying a
+  step-indexed teacher twice per step advances its clock twice and labels every
+  state with the action from the step *after* it — a seed lagging its teacher
+  by exactly one control step.
+
+#### What it produced, and the negative results next to it
+
+Pure behaviour cloning without DAgger is **worse** (all five ~0 viable), so the
+rounds do help. The phase-tracking lag calibration, on the other hand, aliases
+badly — 27, 70, 122, 127, 148-170 control steps across runs, longer than the
+gait's own period — so that machinery is not earning its place even though the
+diagnosis behind it was sound. Both are recorded because a future attempt will
+be tempted by each.
+
+**The generalisable version, for anyone distilling a teacher into a fixed
+policy class: check that the teacher's actions are inside the student's action
+space before you believe a loss curve.** A student that cannot express its
+teacher will report an excellent loss on the part it can express.
+
 ## Watching the gaits
 
 ```bash

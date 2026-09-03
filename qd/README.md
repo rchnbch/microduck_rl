@@ -1817,7 +1817,7 @@ distilled crawl.
 | --- | --- | --- | --- |
 | elites raw | 356 | 263 | 58 |
 | elites verified | 301 | 234 | **58** |
-| archive robustness | 84.6 % | 89.0 % | **100.0 %** |
+| archive robustness (>= 90 % criterion) | 84.6 % | **89.0 % — fails** | **100.0 %** |
 | mean viable replicas | 0.763 | 0.758 | **0.963** |
 | resolvable grid | 7x9 = 63 | 6x8 = 48 | 20x20 = 400 |
 | **resolvable cells >= 0.25 m** | **57** | **41** | **42** |
@@ -1827,34 +1827,63 @@ distilled crawl.
 | elites verifying as another mode | — | 12 (crawl) | 0 |
 
 **The headline: two modes, 83 resolvable cells of verified forward locomotion,
-where v3 had 57 cells of walking.** Crawl did not exist in any previous
+where v3 had 57 cells of walking.** (Coincidentally the same 83 the
+checkpoint-2 walk-only smoke reached on its own; the two numbers count
+different things and should not be read against each other.) Crawl did not exist in any previous
 archive; it is now 58 elites, every one of which survives independent
 verification, at a best of **+1.271 m over 7 s — 18 cm/s, comparable to a
 mid-range walker and five times the 0.25 m bar the criterion asked for.**
 
-#### Walk regressed, and the arithmetic says by how much and why
+#### Walk regressed. It is a real regression, not an artefact of the bar.
 
 The pre-registered bar was **match or beat 57 resolvable cells**; v4 walk holds
-**41**. That is a miss, and it decomposes into two measured parts.
+**41**. That is a genuine miss, and the first explanation reached for — that
+the bar was unreachable at this archive's resolution — **is refuted by this
+job's own checkpoint-2 measurement** and is recorded here so nobody reaches for
+it again.
 
-**The bar was unreachable at this archive's own resolution.** v4 walk's
-resolvable grid is 6x8 = **48 cells**. 57 > 48, so no amount of coverage could
-have reached the bar — the archive fills 41 of the 48 cells its own descriptor
-reproducibility supports (85 %), against v3's 57 of 63 (90 %). The grid
-coarsened because the descriptor was measured more noisily here, and a coarser
-grid caps the achievable count before coverage is even in question.
+The checkpoint-2 walk-only smoke run, under **the same gate and the same
+verifier**, produced a resolvable grid of **11x16 and 83 resolvable cells**
+from 178 verified elites. A walk sub-archive can support far more than 48
+cells. So the final run's 6x8 = 48-cell grid is an **outcome**, not a
+constraint that made 57 impossible from the start:
 
-**And walk got half the search.** The per-mode parent budget (§ the hierarchy)
-splits GA parents evenly across non-empty modes, and crawl was non-empty from
-iteration 0 — so from the first iteration onward walk received **256 of 512
-parents** where v3's walk received all of them. v4's walk archive is the
-product of roughly half of v3's walking search: 263 raw elites against 356.
+| walk archive | raw | verified | mean viable replicas | resolvable grid | cells >= 0.25 m |
+| --- | --- | --- | --- | --- | --- |
+| checkpoint-2 smoke (walk-only, 8 iters) | 205 | 178 | **0.805** | **11x16** | **83** |
+| v3, re-verified | 356 | 301 | 0.763 | 7x9 | 57 |
+| **v4 final (multi-modal, 49 iters)** | 263 | 234 | **0.758** | **6x8** | **41** |
 
-That is not a bug; it is the trade the budget exists to make. Without it, 263
-walkers against 58 crawls would have given crawl 18 % of the parents instead of
-50 %, and the crawl archive above would not exist. **The honest summary is that
-v4 buys 42 crawl cells for 16 walk cells**, and whether that is a good trade is
-a judgement about what the archive is for, not a number.
+Read across the middle column: the resolvable grid tracks **how reliable the
+elites are**, not how many there are. The final walk archive's elites clear the
+gate slightly more often than the smoke's (89.0 % against 86.8 %) but are
+individually less reliable (0.758 viable replicas against 0.805), and a less
+reliable elite spends more of its episode fallen, which makes its descriptor
+noisier, which coarsens the grid its geography can be counted on. 83 cells
+collapse to 41 through the resolution, not through the coverage.
+
+**The likely driver is the parent budget, and that part is by design.** The
+per-mode budget splits GA parents evenly across non-empty modes, and crawl was
+non-empty from iteration 0, so walk drew **256 of 512 parents** where v3's walk
+drew all of them. Shallower search per mode, less reliable elites, noisier
+descriptors, coarser grid. That chain is inference from the numbers above
+rather than a controlled measurement — the controlled version would be a
+walk-only run at the same batch and iteration count, which this job did not
+spend.
+
+Without the budget, 263 walkers against 58 crawls would have handed crawl 18 %
+of the parents instead of 50 %, and the crawl archive would not exist. **The
+trade is 42 crawl cells for 16 walk cells**, and whether that is the right side
+of it is a judgement about what the archive is for.
+
+**Separately, the bar itself was mis-set, and that is an error of a different
+kind.** It was transplanted from v3's re-verified count without checking the
+resolution it would be counted at. A cell count on a 7x9 grid and a cell count
+on a 6x8 grid are not comparable quantities, so the bar as written was
+**uncountable**, not unreachable. The fix for next time is to state a cell bar
+together with the grid it is counted on, or to state it as a fraction of the
+resolvable grid — v3 filled 90 % of its 63, the smoke 47 % of its 176, v4 walk
+85 % of its 48.
 
 #### What the strictness sweep shows about the two modes
 
@@ -1896,6 +1925,12 @@ written.
   dumping ground for the awkward cases.
 
 #### The mechanisms, measured
+
+**Archive robustness, split rather than pooled.** The >= 90 % criterion is met
+**in aggregate at 91.0 %** (292 verified of 321 raw), and that number hides a
+split worth stating: **walk alone is 89.0 % and does not meet it**; crawl is
+100.0 %. The aggregate passes because crawl is perfect and small. Quote all
+three.
 
 * **Incumbent re-testing** ran every iteration from the first, re-testing the
   whole archive each time and **evicting 1,118 elites over the run**. Its own

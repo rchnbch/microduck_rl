@@ -123,8 +123,15 @@ SHELL_FRICTION_RANGE: tuple[float, float] = (0.25, 0.65)
 Wide on purpose: it spans the plausible floors (a carpeted stage grips, a
 lacquered table slides) and it is the only thing standing between a crawl
 policy and a systematic drag error, since the nominal is a literature value
-rather than a measurement. Wire it with
-:func:`mjlab_microduck.tasks.mdp.shell_friction_event_cfg`."""
+rather than a measurement.
+
+**No task wires this yet.** The QD harness pins shell friction at the nominal
+by design (its rollouts are DR-free), and no PPO cfg randomizes it. Adding the
+event term is future work for whoever builds the prone-crawl task: an
+``EventTermCfg(mode="startup", func=dr.geom_friction, ...)`` over the shell
+geom names with ``operation="abs"``, shaped like the existing ``foot_friction``
+term. Until then this range documents the uncertainty rather than training
+against it."""
 
 # Every ground-contact geom carries ``priority=1``. Without it MuJoCo mixes the
 # pair elementwise (``max`` for friction) and the floor's ``mu = 1`` wins, so

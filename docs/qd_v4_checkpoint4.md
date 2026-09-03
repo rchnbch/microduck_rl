@@ -21,7 +21,7 @@ Seeded with five distilled PPO walkers and one distilled crawl.
 | --- | --- | --- | --- |
 | elites raw | 356 | 263 | 58 |
 | elites verified (5-of-8) | 301 | 234 | **58** |
-| archive robustness | 84.6 % | 89.0 % | **100.0 %** |
+| archive robustness | 84.6 % | **89.0 % — below the 90 % bar** | **100.0 %** |
 | mean viable replicas | 0.763 | 0.758 | **0.963** |
 | resolvable grid | 7×9 = 63 | 6×8 = 48 | 20×20 = 400 |
 | **resolvable cells ≥ 0.25 m** | **57** | **41** | **42** |
@@ -43,7 +43,7 @@ Seeded with five distilled PPO walkers and one distilled crawl.
 | **Crawl is real** (≥10 resolvable cells, best ≥0.25 m) | ✅✅ **42 cells, best +1.271 m** — 4× and 5× the bars |
 | Roll attempted honestly (≥3 cells **or** a measured account) | ✅ via the account: 0.22 rad/s over 129 variants against the 0.8 rad/s rule |
 | Mode integrity (≥7/8 label agreement, per-window constancy) | ✅ zero failures in either sub-archive |
-| **Robustness ≥90 % across all sub-archives** | ✅ **91.0 %** (292 of 321) |
+| **Robustness ≥90 % across all sub-archives** | ✅ aggregate **91.0 %** (292/321) — but **walk alone is 89.0 % and fails**; crawl is 100 %. The aggregate passes because crawl is perfect and small. |
 | Incumbent re-testing from iteration 1, pass rate reported | ✅ every iteration, **1,118 evictions**, 80–88 % pass |
 | All distances medians over permuted replicas | ✅ |
 | Viewer mode tabs, README, branch, PR, logs | ✅ |
@@ -53,30 +53,49 @@ Seeded with five distilled PPO walkers and one distilled crawl.
 
 ---
 
-## Why walk regressed, in two measured parts
+## Why walk regressed — and a wrong explanation, corrected
 
-**1. The 57-cell bar was unreachable at this archive's own resolution.** v4
-walk's resolvable grid is **6×8 = 48 cells**. 57 > 48, so no amount of coverage
-could have reached the bar. The archive fills **41 of the 48 cells its own
-descriptor reproducibility supports (85 %)**, against v3's 57 of 63 (90 %). The
-grid coarsened because the descriptor was measured more noisily here, and a
-coarser grid caps the count before coverage is even in question.
+**Walk's 41 cells against the 57 bar is a genuine regression.** My first
+account of it said the bar was *unreachable* at this archive's resolution.
+**That is refuted by this job's own checkpoint-2 measurement**, and the
+correction matters because the wrong version partly excused the result.
 
-This is the same class of mistake v3's README documents making, and I did not
-catch it when the bar was set at checkpoint 1: **a cell-count bar is only
-meaningful alongside the resolution it is counted at.**
+The checkpoint-2 walk-only smoke run, on **the same gate and the same
+verifier**, produced an **11×16 resolvable grid and 83 resolvable cells** from
+178 verified elites. A walk sub-archive can support far more than 48 cells, so
+the final run's 6×8 grid is an **outcome**, not a pre-existing constraint:
 
-**2. Walk got half the search, by design.** The per-mode parent budget splits
-GA parents evenly across non-empty modes, and crawl was non-empty from
-iteration 0 — so walk drew **256 of 512 parents** from the first iteration
-where v3's walk drew all of them. v4's walk archive is the product of roughly
-half of v3's walking search: 263 raw elites against 356.
+| walk archive | raw | verified | mean viable replicas | resolvable grid | cells ≥ 0.25 m |
+| --- | --- | --- | --- | --- | --- |
+| checkpoint-2 smoke (walk-only, 8 iters) | 205 | 178 | **0.805** | **11×16** | **83** |
+| v3, re-verified | 356 | 301 | 0.763 | 7×9 | 57 |
+| **v4 final (multi-modal, 49 iters)** | 263 | 234 | **0.758** | **6×8** | **41** |
 
-That is the budget doing its job, not failing. Without it, 263 walkers against
-58 crawls would have handed crawl **18 %** of the parents instead of 50 %, and
-the crawl archive would not exist. **The trade is 42 crawl cells for 16 walk
-cells.** Whether that is a good trade is a judgement about what the archive is
-for; the criterion as written says walk must not regress, and it did.
+The resolvable grid tracks **how reliable the elites are**, not how many there
+are. The final walk elites clear the gate slightly more often than the smoke's
+(89.0 % vs 86.8 %) but are individually less reliable (0.758 viable replicas vs
+0.805); a less reliable elite spends more of its episode fallen, its descriptor
+is noisier, and the grid its geography can be counted on coarsens. 83 collapses
+to 41 through the *resolution*, not the coverage.
+
+**The likely driver is the parent budget**, and that part is by design: walk
+drew **256 of 512 parents** from iteration 0 where v3's walk drew all of them.
+Shallower search → less reliable elites → noisier descriptors → coarser grid.
+**That chain is inference from the table, not a controlled measurement** — the
+controlled version is a walk-only run at the same batch and iteration count,
+which this job did not spend.
+
+Without the budget, 263 walkers against 58 crawls would have handed crawl 18 %
+of the parents instead of 50 % and the crawl archive would not exist. **The
+trade is 42 crawl cells for 16 walk cells.**
+
+**Separately, the bar was mis-set — a different error, and mine.** I
+transplanted v3's re-verified count into a bar for a different archive without
+checking the resolution it would be counted at. A count on a 7×9 grid and a
+count on a 6×8 grid are not comparable, so the bar as written was
+**uncountable**, not unreachable. State a cell bar with the grid it is counted
+on, or as a fraction of the resolvable grid: v3 filled 90 % of its 63, the
+smoke 47 % of its 176, v4 walk 85 % of its 48.
 
 ---
 
@@ -140,18 +159,23 @@ of one — and the clipping test already proved a genome-expressible crawl exist
 
 ## What I would flag to Alex
 
-1. **The walk miss is a real regression against the criterion**, and the trade
-   that caused it is exactly the one the job was commissioned to make ("the
-   behaviors are not different enough… I don't just want walking"). 83 cells in
-   two modes against 57 in one. Your call whether that is the right side of
-   the trade.
-2. **The 57-cell bar could not have been met** at v4 walk's measured resolution
-   (48 cells total). I set that bar at checkpoint 1 without checking it against
-   the resolution the new archive would have — my error, and the same class of
-   error v3 documented.
-3. **`SHELL_FRICTION = 0.4` is a literature value, not a measurement.** Every
+1. **The walk miss is a real regression**, and I initially explained it in a
+   way that let it off too lightly — the "unreachable bar" account is refuted
+   by this job's own smoke run (11×16 grid, 83 cells, same gate). The trade
+   that caused it is the one the job was commissioned to make ("the behaviors
+   are not different enough… I don't just want walking"): 83 cells in two modes
+   against 57 in one. Your call whether that is the right side of it.
+2. **The bar was also mis-set, separately.** I transplanted v3's cell count
+   without the grid it was counted on, which made it uncountable rather than
+   unreachable — my error at checkpoint 1, and the same class of error v3
+   documented.
+3. **Archive robustness passes only in aggregate.** 91.0 % pooled; walk alone
+   is 89.0 % and misses the bar.
+4. **`SHELL_FRICTION = 0.4` is a literature value, not a measurement**, and
+   **no task randomizes it yet** — the DR event term is future work for the
+   crawl-PPO follow-up. Every
    crawl number inherits its uncertainty. One tribometer reading on a real
    shell retires it; the sensitivity is measured (across the DR range the crawl
    varies ~25 %, but at the legacy µ = 1.0 it is not viable at all).
-4. **Roll remains open.** If a roulade checkpoint exists in wandb, seeding roll
+5. **Roll remains open.** If a roulade checkpoint exists in wandb, seeding roll
    is ~10 minutes of work and the question gets a real answer.

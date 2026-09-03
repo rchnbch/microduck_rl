@@ -122,16 +122,40 @@ class Args:
 
     label_agreement_min: int = 7
     """Replicas that must agree on the episode mode label, out of the replica
-    count. A candidate whose replicas disagree is not a robust anything."""
+    count. A candidate whose replicas disagree is not a robust anything.
 
-    unanimous: bool = True
-    """P2' must hold in every replica. Relaxed to ``label_agreement_min``-of-N
-    only if Stage A' measured the robust probes below 0.95 per replica — with
-    the reason written next to the number."""
+    Stays at 7-of-8 while viability drops to 5-of-8: they are different
+    questions. "Does it keep going" is a chaotic quantity on this simulator;
+    "is it a walk or a crawl" is not — every probe measured 1.000 replica
+    label agreement except the deliberately borderline ones."""
+
+    viable_min: int = 5
+    """Replicas in which P2' must hold, out of ``insertion_replicas``.
+
+    The design asked for unanimous. **Stage A' measured that unanimous-8 admits
+    13 % of known-good walkers** — a Microduck walker passes P2' about 0.78 of
+    the time per replica because it falls, and 0.78^8 = 0.13. 5-of-8 admits
+    83 % of them. The threshold barely moves the negatives (5.3 -> 6.1 expected
+    admissions out of 1661, and five of those are the real crawls found in v1's
+    archive), because their per-replica rates are bimodal: ~0 or 1.0.
+
+    This is §1.4's escape hatch, invoked with the number next to it: *"if
+    Stage A' measures the pass rate of the known robust probes below 0.95 per
+    replica, the rule becomes k-of-8, and the reason is written down."* The
+    measured rate is **0.78**.
+
+    The cost is v2's: a weaker gate readmits marginal policies through the
+    winner's curse over ~50,000 offspring. The designed answer is built and on
+    by default — incumbent re-testing with eviction, below."""
 
     retest_fraction: float = 0.1
-    retest_min_pass_rate: float = 0.875
-    """Eviction threshold for the running pass rate: the 7-of-8 the gate uses."""
+    retest_min_pass_rate: float = 0.60
+    """Eviction threshold for an elite's running pass rate.
+
+    Set from the measurement, not from the gate: a real walker passes P2' at
+    ~0.78 and the marginal junk at ~0.125, so 0.60 sits in the empty middle. A
+    bar at the gate's own 5/8 = 0.625, or at v3's 0.875, would evict genuine
+    walkers for being what they measurably are."""
 
     viability: ViabilityCfg = field(default_factory=ViabilityCfg)
     fitness: FitnessCfg = field(
@@ -166,22 +190,40 @@ class Verdict:
 def fold_replicas(
     per_replica: list[tuple[ModeFeatures, dict[str, np.ndarray]]],
     cfg: ViabilityCfg,
-    unanimous: bool,
-    agreement_min: int,
+    viable_min: int,
+    label_agreement_min: int,
+    label_over_viable_only: bool = True,
 ) -> Verdict:
     """Apply §4.2's insertion rule across replicas.
 
     Three deliberate asymmetries, each because the failure mode being fixed is
     *luck*:
 
-    * **viability is unanimous** (or k-of-N by measured exception) — a
-      candidate that fails P2' one time in N is a candidate that fails it;
+    * **viability is k-of-N**, k measured rather than assumed. The design
+      asked for unanimous; Stage A' measured that a known-good walker passes
+      P2' 0.78 of the time, so unanimous-8 would admit 13 % of the walkers the
+      archive is supposed to hold. See ``Args.viable_min``;
     * **fitness is the median** — not the max, which is the luck-ranking being
       removed, and not the mean, which one catastrophic replica drags around;
     * **the label must agree across replicas** — a robot that sometimes walks
       and sometimes crawls is not a robust anything, and admitting it is how
       the chaos would leak into the archive's *geography* rather than only into
       its fitness.
+
+    ``label_over_viable_only`` decides *which* replicas the label has to agree
+    across, and the default changed on measurement. The design says all of
+    them; but a replica in which the walker fell early is already rejected by
+    the progress clause, and it is also the replica whose label flipped —
+    because the fall is what flipped it. Counting it twice charges one event to
+    two clauses. Measured on v3's own elites: replica label agreement over
+    *all* replicas is 0.836-0.922, which fails a 7-of-8 bar 25-40 % of the
+    time; over the *viable* replicas it is ~1.0, because a viable replica is by
+    definition one that did not fall.
+
+    The clause keeps its teeth where it was aimed: a candidate that walks
+    viably in five replicas and crawls viably in three still fails, because the
+    disagreement is among rollouts that all succeeded. Set ``False`` for the
+    design's literal reading; both are reported in ``qd.check_knowns``.
     """
     verdicts = [evaluate_viability(f, cfg) for f, _a in per_replica]
     viable_stack = np.stack([v.viable for v in verdicts])
@@ -190,8 +232,16 @@ def fold_replicas(
 
     n = viable_stack.shape[0]
     passes = viable_stack.sum(axis=0)
-    viable = passes == n if unanimous else passes >= min(agreement_min, n)
-    viable &= agreeing >= min(agreement_min, n)
+    viable = passes >= min(viable_min, n)
+
+    if label_over_viable_only:
+        # Agreement among the replicas that actually succeeded, scaled back to
+        # the gate's k-of-n scale so the threshold means the same thing however
+        # many replicas happened to be viable.
+        agree_viable = (labels == modal[None, :]) & viable_stack
+        share = agree_viable.sum(axis=0) / np.maximum(passes, 1)
+        agreeing = np.where(passes > 0, share * n, 0.0)
+    viable &= agreeing >= min(label_agreement_min, n)
 
     fitness = np.median(
         np.stack([f.displacement for f, _a in per_replica]), axis=0
@@ -205,7 +255,10 @@ def fold_replicas(
         k: float(np.mean([v.rates()[k] for v in verdicts]))
         for k in ("finite", "progress", "constant_label", "impact")
     }
-    clause_rates["label_agreement"] = float(np.mean(agreeing >= min(agreement_min, n)))
+    clause_rates["label_agreement"] = float(
+        np.mean(agreeing >= min(label_agreement_min, n))
+    )
+    clause_rates["viable_replicas_mean"] = float(np.mean(passes))
     return Verdict(viable, fitness, modal, agreeing, axes, clause_rates)
 
 
@@ -216,10 +269,11 @@ def evaluate_block(
     generator: torch.Generator,
     viability: ViabilityCfg,
     permute: bool,
-    unanimous: bool,
-    agreement_min: int,
+    viable_min: int,
+    label_agreement_min: int,
     bank=None,
     reward=None,
+    label_over_viable_only: bool = True,
 ) -> Verdict:
     """Roll a block out ``reps`` times, permuting world assignment each time."""
     per_replica = []
@@ -244,7 +298,10 @@ def evaluate_block(
         features = ModeFeatures.from_info(info)
         axes = {k[len("axis/") :]: v for k, v in info.items() if k.startswith("axis/")}
         per_replica.append((features, axes))
-    return fold_replicas(per_replica, viability, unanimous, agreement_min)
+    return fold_replicas(
+        per_replica, viability, viable_min, label_agreement_min,
+        label_over_viable_only,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -329,7 +386,7 @@ def main(args: Args | None = None) -> None:
             generator,
             args.viability,
             args.insertion_permute_worlds,
-            args.unanimous,
+            args.viable_min,
             args.label_agreement_min,
             bank=trainer.buffer.add,
             reward=args.reward,
@@ -454,7 +511,7 @@ def main(args: Args | None = None) -> None:
                 block = torch.cat([block, block[:1].repeat(pad, 1)])
             rv = evaluate_block(
                 harness, block, reps, generator, args.viability,
-                args.insertion_permute_worlds, args.unanimous,
+                args.insertion_permute_worlds, args.viable_min,
                 args.label_agreement_min, bank=None,
             )
             evals += len(sample) * reps
@@ -499,7 +556,7 @@ def main(args: Args | None = None) -> None:
             "evaluations": evals,
             "wall_clock_s": time.perf_counter() - t_start,
             "insertion_replicas": reps,
-            "unanimous": args.unanimous,
+            "viable_min": args.viable_min,
             "label_agreement_min": args.label_agreement_min,
             "occupancy": archives.occupancy(),
             "stats": archives.stats(),

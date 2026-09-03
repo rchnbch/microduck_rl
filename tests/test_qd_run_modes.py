@@ -58,36 +58,37 @@ def replicas(specs, n=1):
 
 
 CFG = ViabilityCfg(windows=WINDOWS, d_min=0.05)
+RULED = {"viable_min": 5, "label_agreement_min": 7}
 
 
 # --------------------------------------------------------------------------- #
-# Viability is unanimous
+# Viability is k-of-N, with k measured
 # --------------------------------------------------------------------------- #
 
 
 def test_a_candidate_viable_in_every_replica_is_admitted():
-    v = fold_replicas(replicas([{}] * 8), CFG, unanimous=True, agreement_min=7)
+    v = fold_replicas(replicas([{}] * 8), CFG, **RULED)
     assert v.viable.tolist() == [True]
 
 
-def test_one_failing_replica_out_of_eight_is_enough_to_reject():
-    # v2's lesson: a policy that fails one time in N is a policy that fails,
-    # and admitting it is how an archive fills with coin-flips.
-    specs = [{}] * 7 + [{"dx": 0.0}]
-    v = fold_replicas(replicas(specs), CFG, unanimous=True, agreement_min=7)
-    assert v.viable.tolist() == [False]
+def test_five_of_eight_is_the_ruled_bar_because_a_real_walker_measures_0_78():
+    # Stage A': unanimous-8 would admit 0.78^8 = 13% of KNOWN-GOOD walkers.
+    # The design asked for unanimous; the measurement moved it, and 1.4's
+    # escape hatch is what allows that with the number written down.
+    specs = [{}] * 5 + [{"dx": 0.0}] * 3
+    assert fold_replicas(replicas(specs), CFG, **RULED).viable.tolist() == [True]
 
 
-def test_the_measured_exception_relaxes_to_seven_of_eight():
-    specs = [{}] * 7 + [{"dx": 0.0}]
-    v = fold_replicas(replicas(specs), CFG, unanimous=False, agreement_min=7)
-    assert v.viable.tolist() == [True]
+def test_four_of_eight_is_not_enough():
+    specs = [{}] * 4 + [{"dx": 0.0}] * 4
+    assert fold_replicas(replicas(specs), CFG, **RULED).viable.tolist() == [False]
 
 
-def test_six_of_eight_still_fails_the_relaxed_rule():
+def test_the_bar_is_configurable_so_the_strictness_sweep_can_be_published():
     specs = [{}] * 6 + [{"dx": 0.0}] * 2
-    v = fold_replicas(replicas(specs), CFG, unanimous=False, agreement_min=7)
-    assert v.viable.tolist() == [False]
+    for k, expected in ((5, True), (6, True), (7, False), (8, False)):
+        v = fold_replicas(replicas(specs), CFG, viable_min=k, label_agreement_min=7)
+        assert v.viable.tolist() == [expected], k
 
 
 # --------------------------------------------------------------------------- #
@@ -98,20 +99,20 @@ def test_six_of_eight_still_fails_the_relaxed_rule():
 def test_fitness_is_the_median_not_the_max():
     # One lucky replica must not win a cell: that is the luck-ranking v3 removed.
     specs = [{"dx": 0.1}] * 7 + [{"dx": 10.0}]
-    v = fold_replicas(replicas(specs), CFG, unanimous=True, agreement_min=7)
+    v = fold_replicas(replicas(specs), CFG, **RULED)
     assert v.fitness[0] == pytest.approx(0.1 * NW)
 
 
 def test_fitness_is_the_median_not_the_mean():
     # And one catastrophic replica must not drag a good elite down.
     specs = [{"dx": 0.2}] * 7 + [{"dx": -20.0}]
-    v = fold_replicas(replicas(specs), CFG, unanimous=False, agreement_min=7)
+    v = fold_replicas(replicas(specs), CFG, **RULED)
     assert v.fitness[0] == pytest.approx(0.2 * NW)
 
 
 def test_descriptor_axes_are_medians_too():
     reps = [(features(1), axes(1, height=h)) for h in (0.11, 0.12, 0.13)]
-    v = fold_replicas(reps, CFG, unanimous=True, agreement_min=3)
+    v = fold_replicas(reps, CFG, viable_min=3, label_agreement_min=3)
     assert v.axes["torso_height_mean"][0] == pytest.approx(0.12)
 
 
@@ -122,21 +123,21 @@ def test_descriptor_axes_are_medians_too():
 
 def test_a_candidate_that_sometimes_walks_and_sometimes_crawls_is_rejected():
     specs = [{"f_body": 0.0}] * 5 + [{"f_body": 0.9}] * 3
-    v = fold_replicas(replicas(specs), CFG, unanimous=True, agreement_min=7)
+    v = fold_replicas(replicas(specs), CFG, **RULED)
     assert v.viable.tolist() == [False]
     assert v.agreement[0] == 5
 
 
 def test_seven_of_eight_agreeing_on_the_label_is_enough():
     specs = [{"f_body": 0.9}] * 7 + [{"f_body": 0.0}]
-    v = fold_replicas(replicas(specs), CFG, unanimous=False, agreement_min=7)
+    v = fold_replicas(replicas(specs), CFG, **RULED)
     assert v.viable.tolist() == [True]
     assert MODES[int(v.label[0])] == "crawl"
 
 
 def test_the_reported_label_is_the_modal_one():
     specs = [{"f_body": 0.9}] * 6 + [{"f_body": 0.0}] * 2
-    v = fold_replicas(replicas(specs), CFG, unanimous=True, agreement_min=6)
+    v = fold_replicas(replicas(specs), CFG, viable_min=5, label_agreement_min=6)
     assert MODES[int(v.label[0])] == "crawl"
 
 
@@ -149,18 +150,27 @@ def test_clause_rates_separate_a_progress_collapse_from_a_label_collapse():
     # "Feasibility collapsed" and "feasibility collapsed ON THE LABEL CLAUSE"
     # call for opposite fixes, and v2/v3 both spent iterations on the wrong one.
     stalled = fold_replicas(
-        replicas([{"dx": 0.0}] * 4), CFG, unanimous=True, agreement_min=4
+        replicas([{"dx": 0.0}] * 4), CFG, viable_min=3, label_agreement_min=3
     )
     assert stalled.clause_rates["progress"] == 0.0
     assert stalled.clause_rates["constant_label"] == 1.0
 
-    moving = fold_replicas(replicas([{}] * 4), CFG, unanimous=True, agreement_min=4)
+    moving = fold_replicas(replicas([{}] * 4), CFG, viable_min=3, label_agreement_min=3)
     assert moving.clause_rates["progress"] == 1.0
 
 
 def test_the_impact_clause_is_reported_even_when_no_cap_is_configured():
-    v = fold_replicas(replicas([{}] * 4), CFG, unanimous=True, agreement_min=4)
+    no_cap = ViabilityCfg(windows=WINDOWS, d_min=0.05, impact_cap=None)
+    v = fold_replicas(replicas([{}] * 4), no_cap, viable_min=3, label_agreement_min=3)
     assert v.clause_rates["impact"] == 1.0
+
+
+def test_the_default_cap_excludes_a_violent_rollout_that_still_progresses():
+    # `thrash`: sustains +0.209 m per window at p95 |a_z| = 28.2. Clauses 2-3
+    # admit it; the cap is the only thing that does not.
+    specs = [{"az": 28.0}] * 8
+    assert fold_replicas(replicas(specs), CFG, **RULED).viable.tolist() == [False]
+    assert ViabilityCfg().impact_cap == 17.0
 
 
 # --------------------------------------------------------------------------- #
@@ -253,3 +263,45 @@ def test_the_stage_a_feature_cache_round_trips(tmp_path):
             restored.features[w].p95_az, original.features[w].p95_az
         )
     assert restored.features[2.0].finite.dtype == np.bool_
+
+
+# --------------------------------------------------------------------------- #
+# Which replicas the label has to agree across
+# --------------------------------------------------------------------------- #
+
+
+def test_a_walker_that_falls_is_not_charged_twice_for_the_same_fall():
+    # Six viable walking replicas, two early falls. An early fall is BOTH
+    # non-viable (no progress) and label-flipped (it spends the episode on its
+    # shell) — one event, and the design's literal reading charges it to two
+    # clauses. Measured on v3's own elites, that cost 9 points of admission.
+    specs = [{"f_body": 0.0}] * 6 + [{"f_body": 0.9, "dx": 0.0}] * 2
+    strict = fold_replicas(
+        replicas(specs), CFG, viable_min=5, label_agreement_min=7,
+        label_over_viable_only=False,
+    )
+    assert strict.viable.tolist() == [False], "6/8 label agreement fails a 7/8 bar"
+
+    scoped = fold_replicas(
+        replicas(specs), CFG, viable_min=5, label_agreement_min=7,
+        label_over_viable_only=True,
+    )
+    assert scoped.viable.tolist() == [True], "all six SURVIVING replicas agree"
+
+
+def test_genuine_mode_ambiguity_still_fails_under_the_scoped_reading():
+    # Five viable walks and three viable crawls: the disagreement is among
+    # rollouts that all succeeded, so it is real and the clause must still bite.
+    specs = [{"f_body": 0.0}] * 5 + [{"f_body": 0.9}] * 3
+    v = fold_replicas(
+        replicas(specs), CFG, viable_min=5, label_agreement_min=7,
+        label_over_viable_only=True,
+    )
+    assert v.viable.tolist() == [False]
+
+
+def test_the_scoped_reading_is_the_default():
+    import inspect
+
+    sig = inspect.signature(fold_replicas)
+    assert sig.parameters["label_over_viable_only"].default is True

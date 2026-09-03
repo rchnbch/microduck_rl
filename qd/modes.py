@@ -169,7 +169,20 @@ class ClassifierCfg:
     About one revolution per 7 s. World-horizontal, so a robot spinning on the
     spot is not a roll however fast it spins — see :class:`ModeStats`."""
 
-    hop_air_min: float = 0.10
+    hop_air_min: float = 0.16
+    """Set by Stage A', not by the draft.
+
+    The draft's initial 0.10 ran straight through the measured crawl cluster —
+    per-window ``f_air`` reaches 0.130 on the over-driven chin drag — so two
+    genuine crawls flipped crawl<->hop between windows and failed clause 3 in
+    19-29 % of replicas. 0.16 clears every measured crawl/walk window by five
+    replica sds.
+
+    **One-sided.** There is no hop cluster to bound it from above: hop is
+    dropped (Q1) and Appendix A measured the takeoff speed at 0.19-0.30 m/s
+    against the 0.44 m/s a 1 cm hop needs. A future hop seed must re-measure it
+    rather than inherit it."""
+
     crawl_body_min: float = 0.5
     walk_body_max: float = 0.1
     walk_air_max: float = 0.05
@@ -220,11 +233,19 @@ class ViabilityCfg:
     d_min: float = 0.05
     """Minimum +x displacement per scored window [m]. 2.5 cm/s at W = 2 s.
 
-    An *initial* value. Stage A' sweeps (W, d_min) and picks the setting that
-    maximises the margin between the worst positive probe and the best
-    negative, subject to positives >= 0.95 and negatives <= 0.05 per replica.
-    If no setting clears both bars, that is the finding — the bars do not
-    move."""
+    Chosen by Stage A' and signed off at checkpoint 1. The sweep did **not**
+    clear its pre-registered bars, and this value is not a compromise made to
+    rescue them: over 16 calibration positives and 1661 negatives, no
+    (W, d_min) in the grid reached positives >= 0.95 per replica, because a
+    Microduck *walker* passes any fall-rejecting predicate about 0.78 of the
+    time (v3 measured 0.883 for the same population under the upright gate).
+    The five scripted crawls pass at 1.000 at every setting.
+
+    At this value 24 of 1661 negatives exceed 0.05 per replica, and the five
+    that pass unanimously turned out to be **real crawls** sitting in v1's
+    archive. The bar was not lowered; it was measured to be unreachable by
+    walking, and the aggregation rule moved instead — see
+    :attr:`qd.pga.run_modes.Args.viable_min`."""
 
     exempt_seconds: float = 1.0
     """Leading transition time excused from clauses 2 and 3.
@@ -245,8 +266,17 @@ class ViabilityCfg:
             max(0, round(self.exempt_seconds / windows.stride_seconds)),
         )
 
-    impact_cap: float | None = None
+    impact_cap: float | None = 17.0
     """Cap on p95 trunk ``|a_z|`` [m/s^2]; ``None`` disables clause 4.
+
+    17.0 = 1.5x the worst intended-mode positive (11.3), measured in Stage A'.
+    It **fails the design's rule** that a cap be kept only if it excludes >= 90 %
+    of the degenerates clearing clauses 2-3: it excludes exactly one
+    (``thrash``, p95 |a_z| = 28.2) at every swept setting. Kept anyway, on HQ's
+    checkpoint-1 ruling, because that rule's denominator turned out to be ~1 —
+    every other degenerate clearing clauses 2-3 is gentle (<= 14.6) — and the
+    clause costs the positives nothing at a 1.5x margin. Recorded as a
+    deliberate deviation rather than a silent one.
 
     A percentile, never a max — a max is a luck-ranked operator, and v3's
     winner's curse applies to any max-like clause in a gate. Stage A' sets the

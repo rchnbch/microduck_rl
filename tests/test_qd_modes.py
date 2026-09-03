@@ -297,12 +297,20 @@ def test_standing_still_is_not_viable():
     assert not evaluate_viability(feats).viable.any()
 
 
-def test_impact_cap_excludes_a_violent_rollout_when_enabled():
+def test_impact_cap_excludes_a_violent_rollout():
     feats = run(2, lambda t: 0.2 * t, lambda t: FEET_ONLY, az_of_t=lambda t: 60.0)
-    assert evaluate_viability(feats).viable.all(), "no cap configured -> clause off"
-    v = evaluate_viability(feats, ViabilityCfg(impact_cap=40.0))
+    # The cap is ON by default from checkpoint 1 (17.0 m/s^2, measured).
+    v = evaluate_viability(feats)
     assert not v.viable.any()
     assert not v.impact.any()
+    # Explicitly disabling it turns clause 4 off rather than passing it.
+    assert evaluate_viability(feats, ViabilityCfg(impact_cap=None)).viable.all()
+
+
+def test_a_gentle_rollout_clears_the_default_cap_with_margin():
+    # The cap is 1.5x the worst intended-mode positive (11.3 m/s^2).
+    feats = run(2, lambda t: 0.2 * t, lambda t: FEET_ONLY, az_of_t=lambda t: 11.3)
+    assert evaluate_viability(feats).viable.all()
 
 
 def test_a_non_finite_rollout_is_never_viable():

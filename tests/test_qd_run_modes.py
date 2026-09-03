@@ -224,3 +224,32 @@ def test_the_mode_critic_reward_does_not_pay_for_being_upright():
     assert not hasattr(cfg, "alive_bonus")
     assert cfg.vel_weight == 1.0
     assert cfg.impact_weight > 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Stage A' feature cache
+# --------------------------------------------------------------------------- #
+
+
+def test_the_stage_a_feature_cache_round_trips(tmp_path):
+    # A silently-corrupt cache would be worse than no cache: the sweep would
+    # "succeed" on wrong numbers. ~300 batched rollouts ride on this.
+    from qd.stage_a_prime import ProbeResult, load_results, save_results
+
+    feats = {w: features(3, dx=0.1 * w, f_body=0.5) for w in (1.5, 2.0, 3.0)}
+    original = ProbeResult("p", "crawl", True, "scripted", feats, feats[2.0].displacement)
+    path = save_results([original], tmp_path / "c.npz")
+    restored = load_results(path)[0]
+
+    assert restored.name == "p"
+    assert restored.intended_mode == "crawl"
+    assert restored.positive is True
+    assert sorted(restored.features) == [1.5, 2.0, 3.0]
+    for w in (1.5, 2.0, 3.0):
+        np.testing.assert_allclose(
+            restored.features[w].window_dx, original.features[w].window_dx
+        )
+        np.testing.assert_allclose(
+            restored.features[w].p95_az, original.features[w].p95_az
+        )
+    assert restored.features[2.0].finite.dtype == np.bool_

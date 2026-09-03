@@ -114,6 +114,30 @@ class CpgTeacher:
     Returns **actions**, i.e. deltas from HOME in the env's own joint order,
     because that is what the student emits and what ``JointPositionAction``
     (``target = HOME + action``, scale 1.0) consumes.
+
+    **The teacher is clipped into the student's action space before it drives**
+    (``clip_to_action_box``), and that is the difference between this working
+    and not. The genome emits ``tanh`` at scale 1.0, so it can only command
+    HOME +- 1 rad; v1's CPG crawls fold their knees to 1.9 rad and put
+    **15-24 % of their commands outside that box**. Distilling an unreachable
+    teacher is not a hard optimisation problem, it is an impossible one, and it
+    produced exactly the symptom you would expect if you had not noticed:
+    excellent BC loss (0.0004-0.002) and a student that does not crawl.
+
+    Clipping the teacher first asks the honest question — *is there a crawl in
+    here that a genome could command?* — and for three of the five there is.
+    Measured, free vs clipped, per-replica P2' viability:
+
+    | genome | free | clipped |
+    | --- | --- | --- |
+    | ``v1_cpg_4``   | 0.500 | **1.000** |
+    | ``v1_cpg_169`` | 0.891 | **0.992** |
+    | ``v1_cpg_277`` | 1.000 | **0.953** |
+    | ``v1_cpg_175`` | 1.000 | 0.000 |
+    | ``v1_cpg_6``   | 0.422 | 0.000 |
+
+    Two of them get *better* clipped, which is not a paradox: the clip caps the
+    knee fold, and a less extreme gait is a more repeatable one.
     """
 
     def __init__(
@@ -125,6 +149,7 @@ class CpgTeacher:
         phase_tracking: bool = True,
         max_advance: int = 4,
         back_slip: int = 1,
+        clip_to_action_box: bool = True,
     ):
         from qd import cpg_genome
         from qd.evaluate import cpg_target_trajectory
@@ -151,7 +176,15 @@ class CpgTeacher:
         )
         # (T, 1, 10) absolute leg targets -> (T, 10), and its delta from HOME
         self._target = cpg_target_trajectory(g, times)[:, 0, :]
-        self._delta = self._target - self._home_legs
+        delta = self._target - self._home_legs
+        self.clipped_fraction = float((delta.abs() > 1.0).float().mean())
+        if clip_to_action_box:
+            delta = delta.clamp(-1.0, 1.0)
+            # The reference the phase tracker matches against has to be the
+            # trajectory actually being commanded, or it tracks a gait the
+            # robot is not performing.
+            self._target = self._home_legs + delta
+        self._delta = delta
         self._step = 0
         self._phase: torch.Tensor | None = None
         self.lag: int = 0
@@ -236,6 +269,12 @@ class Args:
     """Label by the phase the student has REACHED, not by the wall clock.
 
     Off reproduces the measured failure — see :class:`CpgTeacher`."""
+
+    clip_to_action_box: bool = True
+    """Clip the teacher into HOME +- 1 rad before it drives.
+
+    Off distils a teacher the genome cannot command — see :class:`CpgTeacher`
+    for what that looks like in a log."""
 
     viability: ViabilityCfg = field(default_factory=ViabilityCfg)
     classifier: ClassifierCfg = field(default_factory=ClassifierCfg)
@@ -409,11 +448,18 @@ def main(args: Args | None = None) -> None:
         teacher = CpgTeacher(
             genomes[idx], harness, harness.control_dt,
             phase_tracking=args.phase_tracking,
+            clip_to_action_box=args.clip_to_action_box,
+        )
+        print(
+            f"  teacher clipped into the action box: "
+            f"{teacher.clipped_fraction * 100:.1f}% of its commands altered",
+            flush=True,
         )
         genome, log = distil_cpg(teacher, harness, args.seeding, spec, generator)
         stats = score(genome, harness, args)
         seeds.append(genome)
         report.append({"source": f"v1_cpg_{idx}", "index": int(idx),
+                       "teacher_clipped_fraction": teacher.clipped_fraction,
                        "distillation": log, **stats})
         print(
             f"  -> viable {stats['per_replica_viable']:.3f} per replica, "

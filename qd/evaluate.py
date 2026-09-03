@@ -40,6 +40,19 @@ NOMINAL_VIN: float = 7.4
 SPAWN_HEIGHT: float = 0.125
 
 FEET_CONTACT_SENSOR = "feet_ground_contact"
+GROUND_CONTACT_SENSOR = "qd_ground_contact"
+"""Per-geom robot/terrain contact — what the v4 mode classifier reads.
+
+The feet sensor answers "are the soles down", which is the whole story for a
+walker and none of it for a crawl. This one covers *every* ground-capable geom
+on the robot, so ``f_feet`` / ``f_body`` / ``f_air`` are a partition rather
+than three guesses."""
+
+HEAD_CONTACT_BODY = "jaw_soft"
+"""The body carrying the three head-shell collision meshes.
+
+Head involvement is what separates an over-the-head roll from a shoulder roll
+— the roulade env needed a head-top latch for exactly that distinction."""
 
 
 @dataclass(frozen=True)
@@ -82,6 +95,22 @@ class HarnessCfg:
     See :class:`qd.pga.evaluate.PolicyHarnessCfg.full_gait_stats`; off unless
     the descriptor needs them or a measurement wants every candidate axis."""
 
+    mode_channels: bool = False
+    """Build the per-geom ground-contact sensor and accumulate P2' features.
+
+    v4's gate reads contact *classes*, not foot contact, so it needs a sensor
+    the v1-v3 harness never built. Off by default: a v3 command line must keep
+    producing byte-for-byte v3 physics, and an extra sensor changes the
+    compiled model."""
+
+    shell_friction: float | None = None
+    """Override the shell ``mu`` this rollout runs at; ``None`` keeps the repo's.
+
+    The nominal is a literature value for PLA, not a hardware measurement
+    (:data:`mjlab_microduck.robot.microduck_constants.SHELL_FRICTION`), so the
+    sensitivity of a crawl to it is a number worth having —
+    ``qd.check_shell_contacts --sweep-friction`` uses this."""
+
     njmax: int = 128
     """Constraints allocated per world.
 
@@ -120,6 +149,10 @@ def _deterministic_robot_cfg(harness_cfg: HarnessCfg):
         if harness_cfg.full_collision
         else MICRODUCK_WALK_ROBOT_CFG
     )
+    if harness_cfg.shell_friction is not None:
+        cfg = dataclasses.replace(
+            cfg, collisions=(_shell_friction_collision(harness_cfg.shell_friction),)
+        )
     assert cfg.articulation is not None
     actuators = tuple(
         dataclasses.replace(
@@ -135,6 +168,21 @@ def _deterministic_robot_cfg(harness_cfg: HarnessCfg):
     return dataclasses.replace(
         cfg,
         articulation=dataclasses.replace(cfg.articulation, actuators=actuators),
+    )
+
+
+def _shell_friction_collision(mu: float):
+    """``FULL_COLLISION`` with the shell ``mu`` replaced, feet untouched."""
+    import dataclasses as _dc
+
+    from mjlab_microduck.robot.microduck_constants import FULL_COLLISION
+
+    return _dc.replace(
+        FULL_COLLISION,
+        friction={
+            r"^(left|right)_foot_collision$": (1.0,),
+            r".*_collision": (float(mu),),
+        },
     )
 
 
@@ -155,6 +203,76 @@ def _feet_contact_sensor_cfg():
         reduce="netforce",
         num_slots=1,
     )
+
+
+@dataclass(frozen=True)
+class ContactGeoms:
+    """Which ground-capable geoms exist, and which of them are feet or head."""
+
+    names: tuple[str, ...]
+    feet: tuple[str, ...]
+    head: tuple[str, ...]
+
+
+def ground_contact_geoms(full_collision: bool = True) -> ContactGeoms:
+    """Every geom that can touch the terrain, split into feet / head / rest.
+
+    Read off the spec the robot cfg actually builds rather than hardcoded: the
+    contact shell is completed and named at spec-build time
+    (:mod:`mjlab_microduck.robot.shell_contacts`), so a re-export from Onshape
+    changes this list and nothing else has to be edited."""
+    from mjlab_microduck.robot.microduck_constants import (
+        get_standup_spec,
+        get_walk_spec,
+    )
+    from mjlab_microduck.robot.shell_contacts import (
+        FOOT_GEOM_NAMES,
+        collision_geoms_on_bodies,
+        ground_collision_geom_names,
+    )
+
+    spec = get_standup_spec() if full_collision else get_walk_spec()
+    return ContactGeoms(
+        names=ground_collision_geom_names(spec),
+        feet=FOOT_GEOM_NAMES,
+        head=collision_geoms_on_bodies(spec, (HEAD_CONTACT_BODY,)),
+    )
+
+
+def _ground_contact_sensor_cfg(geom_names: tuple[str, ...]):
+    """One slot per ground-capable geom, with the net force behind it."""
+    from mjlab.sensor import ContactMatch, ContactSensorCfg
+
+    return ContactSensorCfg(
+        name=GROUND_CONTACT_SENSOR,
+        primary=ContactMatch(mode="geom", pattern=tuple(geom_names), entity="robot"),
+        secondary=ContactMatch(mode="body", pattern="terrain"),
+        fields=("found", "force"),
+        reduce="netforce",
+        num_slots=1,
+    )
+
+
+def resolve_contact_columns(robot, geoms: ContactGeoms):
+    """``(names, foot_columns, head_columns)`` in the sensor's own column order.
+
+    The sensor resolves its primaries with ``entity.find_geoms(patterns)``,
+    which returns them in *model* order, not in the order they were listed. So
+    the column order is asked of the same call rather than assumed — getting
+    this wrong would silently swap "the soles are down" for "the head is down"
+    in every classifier feature, and every mode label with it.
+    """
+    _, resolved = robot.find_geoms(list(geoms.names))
+    resolved = tuple(resolved)
+    feet = tuple(i for i, n in enumerate(resolved) if n in geoms.feet)
+    head = tuple(i for i, n in enumerate(resolved) if n in geoms.head)
+    if len(feet) != len(geoms.feet):
+        raise RuntimeError(
+            f"expected {geoms.feet} among the ground-contact geoms, got {resolved}"
+        )
+    if not head:
+        raise RuntimeError(f"no head-shell geom among {resolved}")
+    return resolved, feet, head
 
 
 class MicroduckRolloutHarness:
@@ -178,11 +296,17 @@ class MicroduckRolloutHarness:
         self.cfg = cfg
         self.fitness = fitness or FitnessCfg()
 
+        sensors = [_feet_contact_sensor_cfg()]
+        self.contact_geoms = None
+        if cfg.mode_channels:
+            self.contact_geoms = ground_contact_geoms(cfg.full_collision)
+            sensors.append(_ground_contact_sensor_cfg(self.contact_geoms.names))
+
         scene_cfg = SceneCfg(
             num_envs=cfg.num_envs,
             terrain=TerrainEntityCfg(terrain_type="plane"),
             entities={"robot": _deterministic_robot_cfg(cfg)},
-            sensors=(_feet_contact_sensor_cfg(),),
+            sensors=tuple(sensors),
         )
         self.scene = Scene(scene_cfg, device=cfg.device)
         self.sim = Simulation(
@@ -207,6 +331,11 @@ class MicroduckRolloutHarness:
         self._collect_extras = bool(cfg.full_gait_stats or self.descriptor.needs)
 
         self.robot = self.scene.entities["robot"]
+        self.contact_columns = None
+        if self.contact_geoms is not None:
+            self.contact_columns = resolve_contact_columns(
+                self.robot, self.contact_geoms
+            )
         self.leg_joint_ids, leg_names = self.robot.find_joints(
             list(cpg_genome.LEG_JOINT_NAMES), preserve_order=True
         )
@@ -219,6 +348,19 @@ class MicroduckRolloutHarness:
         soft_lo, soft_hi = cpg_genome.soft_leg_joint_limits()
         self._soft_lo = torch.as_tensor(soft_lo, dtype=torch.float32, device=device)
         self._soft_hi = torch.as_tensor(soft_hi, dtype=torch.float32, device=device)
+
+        # All 14 servos, in the repo's canonical order. The CPG path pins the
+        # neck at HOME; the v4 probes do not — a log-roll is driven by hip roll
+        # and head yaw in quadrature, and the roulade env needed a chin tuck to
+        # get over the head at all (design draft, 5.3).
+        self.servo_joint_ids, self.servo_joint_names = self.robot.find_joints(
+            [r"^(?!passive_).*"]
+        )
+        self._servo_ids_t = torch.as_tensor(self.servo_joint_ids, device=device)
+        self._home_servo_targets = self._home_joint_pos[:, self._servo_ids_t].clone()
+        lo, hi = cpg_genome.soft_joint_limits(self.servo_joint_names)
+        self._servo_lo = torch.as_tensor(lo, dtype=torch.float32, device=device)
+        self._servo_hi = torch.as_tensor(hi, dtype=torch.float32, device=device)
 
     # -- properties ------------------------------------------------------- #
 
@@ -239,27 +381,63 @@ class MicroduckRolloutHarness:
         """``(N, 10)`` HOME angles of the leg joints, in genome order."""
         return self._home_leg_targets
 
+    @property
+    def home_servo_targets(self) -> torch.Tensor:
+        """``(N, 14)`` HOME angles of every servo, in ``servo_joint_names`` order."""
+        return self._home_servo_targets
+
     # -- simulation ------------------------------------------------------- #
 
-    def reset(self) -> None:
-        """Return every world to the HOME pose at the spawn height, at rest."""
+    def reset(self, pose=None) -> None:
+        """Return every world to a spawn pose at rest; HOME standing by default.
+
+        ``pose`` is a :class:`qd.spawn.SpawnPose`. The archive always spawns
+        standing (§4.1: displacement is measured from the same start for every
+        mode, transition included), so this argument exists for the Stage A'
+        *probes*: no open-loop posture survives a standing start on this robot —
+        a 0.4 s ramp to SIT topples at 0.36 s and 0 of 42 slow squats held to
+        3 s — so a scripted crawl has to be measured from prone, and a scripted
+        log-roll from its side.
+        """
         self.sim.reset(None)
         self.scene.reset(None)
 
         root_state = self.robot.data.default_root_state.clone()
-        root_state[:, 2] = self.cfg.spawn_height
+        joint_pos = self._home_joint_pos.clone()
+        if pose is None:
+            root_state[:, 2] = self.cfg.spawn_height
+        else:
+            root_state[:, 2] = pose.height
+            quat = torch.as_tensor(
+                pose.quat_wxyz, dtype=root_state.dtype, device=root_state.device
+            )
+            root_state[:, 3:7] = quat
+            for pattern, angle in (pose.joint_pos or {}).items():
+                ids, _ = self.robot.find_joints([pattern])
+                joint_pos[:, torch.as_tensor(ids, device=joint_pos.device)] = angle
         self.robot.write_root_state_to_sim(root_state)
-        self.robot.write_joint_state_to_sim(
-            self._home_joint_pos, torch.zeros_like(self._home_joint_pos)
-        )
-        self.robot.set_joint_position_target(self._home_joint_pos)
+        self.robot.write_joint_state_to_sim(joint_pos, torch.zeros_like(joint_pos))
+        self.robot.set_joint_position_target(joint_pos)
+        self._spawn_joint_pos = joint_pos
         self.scene.write_data_to_sim()
         self.sim.forward()
+
+    @property
+    def spawn_servo_targets(self) -> torch.Tensor:
+        """``(N, 14)`` servo angles of the pose the last :meth:`reset` wrote."""
+        pos = getattr(self, "_spawn_joint_pos", self._home_joint_pos)
+        return pos[:, self._servo_ids_t]
 
     def set_leg_targets(self, targets: torch.Tensor) -> None:
         """Command the 10 leg joints; neck/head stay at their HOME target."""
         self.robot.set_joint_position_target(
             targets.clamp(self._soft_lo, self._soft_hi), joint_ids=self._leg_ids_t
+        )
+
+    def set_servo_targets(self, targets: torch.Tensor) -> None:
+        """Command all 14 servos, in ``servo_joint_names`` order."""
+        self.robot.set_joint_position_target(
+            targets.clamp(self._servo_lo, self._servo_hi), joint_ids=self._servo_ids_t
         )
 
     def step(self) -> None:
@@ -306,9 +484,52 @@ class MicroduckRolloutHarness:
             "qfrc_actuator": d.qfrc_actuator,
         }
 
+    def mode_channels(self) -> dict[str, torch.Tensor] | None:
+        """Per-geom ground contact + the rates :class:`qd.modes.ModeStats` folds.
+
+        ``None`` when the harness was not built with ``mode_channels``: a v3
+        run must not pay for a sensor it does not read."""
+        if self.contact_columns is None:
+            return None
+        sensor = self.scene.sensors[GROUND_CONTACT_SENSOR].data
+        found = sensor.found
+        assert found is not None
+        n_geoms = len(self.contact_columns[0])
+        d = self.robot.data
+        out = {
+            "contact_found": found.reshape(self.num_envs, -1)[:, :n_geoms],
+            "ang_vel_w": d.root_link_ang_vel_w,
+            "lin_vel_w": d.root_link_lin_vel_w,
+        }
+        if sensor.force is not None:
+            out["contact_force"] = sensor.force.reshape(self.num_envs, -1, 3)[
+                :, :n_geoms
+            ]
+        return out
+
+    def make_mode_stats(self, windows):
+        """A :class:`qd.modes.ModeStats` wired to this harness's column order."""
+        from qd.modes import ModeStats
+
+        if self.contact_columns is None:
+            raise RuntimeError(
+                "harness was built without mode_channels; P2' has nothing to read"
+            )
+        names, feet, head = self.contact_columns
+        return ModeStats(
+            self.num_envs,
+            self.device,
+            windows,
+            num_contact_geoms=len(names),
+            foot_columns=feet,
+            head_columns=head,
+        )
+
     # -- generic rollout -------------------------------------------------- #
 
-    def rollout(self, controller, recorder=None) -> tuple[np.ndarray, np.ndarray, dict]:
+    def rollout(
+        self, controller, recorder=None, mode_stats=None
+    ) -> tuple[np.ndarray, np.ndarray, dict]:
         """Settle at HOME, then run ``controller`` and score the result.
 
         ``controller(step, t)`` returns ``(num_envs, 10)`` leg targets for
@@ -342,6 +563,23 @@ class MicroduckRolloutHarness:
             control_dt=self.control_dt,
         )
         metrics.begin(self.base_pos())
+        accel = None
+        # `mode_stats` may be a LIST: the Stage A' sweep needs the same rollout
+        # accumulated at three window lengths, and the physics does not depend
+        # on how it is windowed. Rolling once per setting tripled the cost of
+        # the sweep for nothing.
+        mode_stats = (
+            None
+            if mode_stats is None
+            else (list(mode_stats) if isinstance(mode_stats, (list, tuple)) else [mode_stats])
+        )
+        if mode_stats is not None:
+            from qd.modes import VerticalAccel
+
+            for ms in mode_stats:
+                ms.begin(self.base_pos())
+            accel = VerticalAccel(self.num_envs, self.device, self.control_dt)
+            accel.begin(self.robot.data.root_link_lin_vel_w)
         alive = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         for k in range(episode_steps):
             self.set_leg_targets(controller(k, k * self.control_dt))
@@ -353,16 +591,39 @@ class MicroduckRolloutHarness:
                 self.foot_contact(),
                 self.gait_extras(),
             )
+            if mode_stats is not None:
+                ch = self.mode_channels()
+                assert ch is not None
+                az = accel.step(ch["lin_vel_w"])
+                for ms in mode_stats:
+                    ms.update(
+                        self.base_pos(),
+                        self.projected_gravity(),
+                        ch["contact_found"],
+                        ch["ang_vel_w"],
+                        trunk_az=az,
+                        contact_force=ch.get("contact_force"),
+                    )
             alive = ~metrics.fallen
             if recorder is not None:
                 recorder("episode", k, was_alive)
+            # Under P2' nothing "falls", so this early-out never fires; it is
+            # left in place so a v3 command line keeps its behaviour exactly.
             if (
                 self.cfg.fall_check_every
                 and (k + 1) % self.cfg.fall_check_every == 0
                 and not bool(alive.any())
             ):
                 break
-        return metrics.finalize()
+        fitness, measures, info = metrics.finalize()
+        if mode_stats is not None:
+            # One `info` per window setting, prefixed so a multi-window
+            # rollout comes back as `mode/...` for the first (the default the
+            # single-stats callers read) and `mode<W>/...` for the rest.
+            for i, ms in enumerate(mode_stats):
+                prefix = "mode/" if i == 0 else f"mode{i}/"
+                info.update(ms.finalize().to_info(prefix))
+        return fitness, measures, info
 
     def close(self) -> None:
         self.scene = None  # type: ignore[assignment]
@@ -436,6 +697,33 @@ class CpgEvaluator:
         times = torch.arange(steps, dtype=torch.float32, device=device) * h.control_dt
         traj = cpg_target_trajectory(genomes_t, times)  # (T, B, 10)
         return h.rollout(lambda k, _t: traj[k], recorder=recorder)
+
+    def evaluate_with_modes(self, block: np.ndarray, mode_stats):
+        """One chunk, accumulating P2' features alongside fitness.
+
+        Used by Stage A' to run v1's CPG elites through the v4 gate. Chunk-
+        sized only (no splitting): a ``ModeStats`` is bound to a world count,
+        and silently reusing one across chunks would mix two rollouts."""
+        h = self.harness
+        block = self.space.clip(np.atleast_2d(np.asarray(block, dtype=np.float64)))
+        if block.shape[0] != h.num_envs:
+            raise ValueError(
+                f"{block.shape[0]} genomes for {h.num_envs} worlds; "
+                "evaluate_with_modes takes exactly one chunk"
+            )
+        genomes_t = torch.as_tensor(block, dtype=torch.float32, device=h.device)
+        steps = round(h.fitness.episode_seconds / h.control_dt)
+        times = torch.arange(steps, dtype=torch.float32, device=h.device) * h.control_dt
+        traj = cpg_target_trajectory(genomes_t, times)
+        _f, _m, info = h.rollout(lambda k, _t: traj[k], mode_stats=mode_stats)
+        from qd.modes import ModeFeatures
+
+        if not isinstance(mode_stats, (list, tuple)):
+            return ModeFeatures.from_info(info)
+        return {
+            i: ModeFeatures.from_info(info, "mode/" if i == 0 else f"mode{i}/")
+            for i in range(len(mode_stats))
+        }
 
     def replay(self, genome: np.ndarray, recorder=None):
         """Evaluate a single genome, broadcast across every world.

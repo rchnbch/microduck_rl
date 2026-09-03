@@ -1472,6 +1472,489 @@ plus random initialisation, 16 rollouts) 278 s, then **141 s per iteration** —
 clock, because eight replicas of one batch amortise better than eight separate
 generations.
 
+## Walking v4 — modes of forward motion, and a gate that admits them
+
+Alex's verdict on v3: *"the behaviours are not different enough… I don't just
+want walking."* v3's archive is 268 verified walkers in 109 resolvable cells,
+and every one of them is a walker, because the gate said so: `base z < 0.075`
+is "fallen", and the verified-stable SIT keyframe sits at 0.061 m. **Every
+non-walking rest pose this robot has is fallen to v3, before the first step.**
+
+v4 replaces the gate, not the search. The design is
+[`docs/qd_mode_descriptors_draft.md`](../docs/qd_mode_descriptors_draft.md);
+this section is what it measured out to be.
+
+### 0. The contact model was wrong, and it was wrong invisibly
+
+Before any of it, a sim2real footgun of exactly the kind AGENTS.md lists.
+
+`FULL_COLLISION` addresses geoms by **name**:
+
+```python
+CollisionCfg(geom_names_expr=[".*_collision"],
+             condim={r"^(left|right)_foot_collision$": 3, ".*_collision": 1}, ...)
+```
+
+`onshape-to-robot` names a geom only when the CAD part is tagged, and it tags
+two: the soles. So the `condim=1` rule written to make the shells frictionless
+**has never matched a geom**. Read off the compiled model:
+
+| | legacy | fixed |
+| --- | --- | --- |
+| geoms that can touch the ground | 10 | **14** |
+| of those, *named* | 2 | **14** |
+| shell `condim` / `priority` / `mu` | 3 / 0 / **1.0** (MuJoCo defaults) | 3 / **1** / **0.4** |
+
+Two more consequences of the anonymity, both silent:
+
+* `CollisionCfg.disable_other_geoms` collects the non-matching names into a
+  **set**, so ~70 unnamed geoms collapse to a single `''` entry and at most one
+  of them is ever disabled. The shells were live by accident, not by design.
+* `priority 0` means the pair is mixed elementwise (`max` for friction), so a
+  shell set to `mu = 0.4` against a `mu = 1` floor still slides at 1.0. Only
+  `priority >= 1` on the robot geom makes the number written the number used —
+  which is why the soles already carried it and nothing else did.
+
+And the export gives **no ground-collision geom at all** to the upper legs or
+the trunk side shells — exactly what a prone or side-lying robot rests on.
+
+`robot/shell_contacts.py` fixes all three on the `MjSpec`, not in the generated
+MJCF, so a re-export from Onshape cannot undo it. What it is worth, measured by
+settling each rest pose for 3 s on both models (`qd.check_shell_contacts`):
+
+| pose | legacy settled z | fixed settled z | sink | what carries it on the fixed model |
+| --- | --- | --- | --- | --- |
+| stand (topples, as it must) | 0.0474 | 0.0438 | +3.6 mm | soles, jaw |
+| prone | 0.0352 | 0.0353 | −0.1 mm | hips, soles, jaw |
+| supine | 0.0471 | 0.0476 | −0.5 mm | **trunk side shells**, top head shell, soles |
+| **side** | 0.0408 | **0.0669** | **−26.1 mm** | **upper leg**, jaw |
+| sit | 0.0651 | 0.0643 | +0.8 mm | soles, shanks, **upper legs** |
+
+A side-lying robot used to settle 26 mm too low — resting on a thigh that did
+not exist. Four of the five poses are now carried, at least in part, by a geom
+the export never had.
+
+**The shell `mu` is a literature value, not a hardware measurement**, and it is
+labelled as such in `microduck_constants.SHELL_FRICTION`: 0.4 is the mid-point
+of the published range for PLA on a hard smooth floor, with
+`SHELL_FRICTION_RANGE = (0.25, 0.65)` for DR and a sensitivity sweep
+(`--sweep-friction`) so the choice is revisable against one measurement rather
+than baked into a policy. What it replaces is worse than a guess: printed
+plastic gripping the floor exactly as hard as the rubber soles.
+
+#### How much does the number matter? (`--sweep-friction`)
+
+The best scripted crawl (`crawl_chin_drag_tuned`, 64 replicas), re-run at four
+shell frictions:
+
+| shell mu | displacement / 7 s | worst 2 s window | f_body | p95 \|a_z\| |
+| --- | --- | --- | --- | --- |
+| 0.25 (DR floor) | +0.749 m | 0.215 m | 0.719 | 11.4 |
+| **0.40 (nominal)** | **+0.725 m** | **0.214 m** | 0.731 | 11.3 |
+| 0.65 (DR ceiling) | +0.582 m | 0.167 m | 0.721 | 12.1 |
+| **1.00 (the legacy default)** | **+0.293 m** | **0.084 m** | 0.823 | 12.7 |
+
+Two readings, and the second is the important one.
+
+Across the DR range the crawl varies by ~25 % — so *within* the uncertainty the
+literature value carries, the choice is not critical, which is what makes it
+tolerable to ship a cited number instead of a measured one.
+
+At the **legacy** mu = 1.0 the same crawl travels **2.5x less**, and its worst
+2 s window falls to 0.084 m — **below the calibrated `d_min` of 0.10 m**. On the
+model v1-v3 ran, the best scripted crawl is *not viable under P2'*. The shell
+contact model is not a tidy-up: it is the difference between crawl existing and
+crawl not existing.
+
+#### The cost, stated: self-collision goes up
+
+Naming the shells makes them addressable; adding the thigh and side-shell geoms
+makes them *touchable*, including by each other. Six env cfgs in this repo
+charge a `self_collision` penalty, so this is a real change to their reward
+baselines. Measured over random joint configurations at several distances from
+HOME (CPU, base held clear of the floor so only self-contacts remain):
+
+| joint sampling | legacy mean | fixed mean | legacy any | fixed any |
+| --- | --- | --- | --- | --- |
+| HOME | 0.000 | 0.000 | 0.000 | 0.000 |
+| HOME + N(0, 0.1) | 0.005 | 0.007 | 0.004 | 0.006 |
+| HOME + N(0, 0.3) | 0.291 | 0.523 | 0.226 | 0.311 |
+| HOME + N(0, 0.6) | 0.747 | 1.732 | 0.463 | 0.605 |
+| uniform over limits | 0.885 | 2.385 | 0.428 | 0.577 |
+
+**No constant tax**: at HOME and in the ±0.1 rad neighbourhood a walking policy
+occupies, the change is 0.005 → 0.007 contacts per configuration. The increase
+appears in folded, large-excursion poses, and the pairs it comes from —
+`bottom_head_shell x trunk_side_shell` above all — are physically real: the head
+is 38 % of body mass and it really can hit the side of the torso. Tasks that
+deliberately fold (standup, roulade, the crawl task to come) should expect a
+slightly larger self-collision reading and should be re-baselined rather than
+surprised.
+
+### 1. Stage A' — what calibrating a predicate actually measured
+
+`qd/measurements/stage_a_prime.md` is the artefact; this is what it says.
+
+**The probes had to be swept, not written.** Every hand-written crawl
+parameterisation crawled *backwards* (-0.05 to -0.24 m over 7 s) and no roll
+probe rotated. One probe per world makes a sweep cost what a single probe
+costs, so the whole (base x direction x frequency x amplitude) grid went
+through — 396 variants over six batched rollouts. The direction of travel of a
+drag gait is a property of its phase relationship, and it was a coin flip which
+way the hand-written guess pointed.
+
+**Roll does not roll open-loop.** Best supported world-horizontal rotation over
+129 swept roll variants: **0.22 rad/s** against the 0.8 rad/s the rule wants.
+The roll threshold is therefore **uncalibrated** — there is no roll cluster to
+place it against — and stays at the design's arithmetic (one revolution per
+episode) until a distilled roulade checkpoint gives it a member.
+
+**A threshold that cut through a real behaviour.** The design's initial
+`hop_air_min = 0.10` runs straight through the measured crawl cluster, whose
+per-window `f_air` reaches 0.130 on the over-driven chin drag: two genuine
+crawls flipped crawl<->hop between windows and failed the label clause in
+19-29 % of replicas. Raised to **0.16**, which is the design's own remedy for
+this case, and reported as **one-sided** — hop is dropped and has no cluster to
+bound the threshold from above.
+
+#### Chaos per mode, and why it decides everything else
+
+| mode | probes | median displacement | mean replica sd |
+| --- | --- | --- | --- |
+| crawl | 9 | +0.384 m | **0.0028 m** |
+| roll | 3 | -0.053 m | 0.0026 m |
+| **walk** | 11 | +1.430 m | **0.5591 m** |
+
+Walking is **200x more chaotic** than an open-loop crawl, reproducing v2's
+0.605 m. Every awkward number below follows from this one.
+
+#### The pre-registered bars were not met, and the reason is structural
+
+The bar was positives >= 0.95 and negatives <= 0.05 **per replica**. Over 16
+calibration positives and 1661 negatives (292 v1 MLP divers, 340 v1 CPG elites,
+1024 random MLPs, 5 scripted degenerates), **no setting in the grid cleared
+both**. The five that reach >= 0.95 everywhere are the five scripted crawls, at
+1.000. The eleven that never do are the eleven walk positives.
+
+Clause breakdown at W = 2 s, d_min = 0.05 m — every failure is the *progress*
+clause, none is `finite`:
+
+| probe | viable | progress | label | median displacement |
+| --- | --- | --- | --- | --- |
+| walk_seed_0 | 0.227 | 0.227 | 1.000 | 0.190 m |
+| walk_seed_1..5 | 0.71-0.81 | 0.71-0.81 | 1.000 | 0.68-1.43 m |
+| v3_elite_0..4 | 0.71-0.80 | 0.78-0.81 | 0.87-0.98 | 1.72-2.09 m |
+| the five tuned crawls | **1.000** | **1.000** | **1.000** | 0.38-0.72 m |
+
+**A Microduck walker passes P2' about 0.78 of the time per replica, because a
+Microduck walker falls.** v3 independently measured mean per-elite survival at
+**0.883** under the *upright* gate; P2' is a little stricter because it also
+demands sustained progress. Loosening `d_min` to 0.02 raises walk only to
+0.72-0.84 — the grid does not control what they fail on.
+
+So the bar is achievable by a near-deterministic open-loop crawl and
+unachievable by any closed-loop walker on this simulator. That is a property of
+the robot, not of the predicate, and no threshold was moved to hide it.
+
+#### The negatives that passed were not a hole. They were crawls.
+
+Five v1 CPG elites clear P2' at W = 2, d_min = 0.05. Re-run at **128
+world-permuted replicas**:
+
+| genome | viable | label | agreement | window constancy | median dx | sd | f_body | p95 \|a_z\| |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **v1_cpg_175** | **1.000** | crawl | 1.000 | 1.000 | **+0.543 m** | 0.0018 m | 0.789 | 6.1 |
+| **v1_cpg_277** | **1.000** | crawl | 1.000 | 1.000 | **+0.359 m** | 0.0057 m | 0.914 | 3.1 |
+| v1_cpg_169 | 0.859 | crawl | 1.000 | 1.000 | +0.306 m | 0.0159 m | 0.923 | 4.0 |
+| v1_cpg_4 | 0.594 | crawl | 1.000 | 1.000 | +0.447 m | 0.0193 m | 0.874 | 5.9 |
+| v1_cpg_6 | 0.461 | crawl | 1.000 | 1.000 | +0.320 m | 0.0131 m | 0.871 | 4.2 |
+
+They spawn **standing at HOME**, get themselves down, and travel 0.31-0.54 m on
+their shells with gentle impacts — the same range as the hand-tuned scripted
+crawls, and further than three of them. **These have been in v1's MAP-Elites
+archive since j002, filed as junk because the upright gate called them fallen.**
+
+The design says a negative that passes is either a genuine mode or a hole in
+the predicate, and must be reported by name either way. These are genuine, and
+they are the first crawls anyone has found on this robot. They are 31-D CPG
+genomes, so seeding the v4 archive with them needs the same behaviour-cloning
+distillation `qd.seed` already runs for the PPO walker — but unlike a scripted
+probe they start standing, so the distillation is well-posed.
+
+One more thing they show: the 8-replica estimate had all five at 1.000, and at
+128 replicas three of them fell to 0.46-0.86. Small-sample optimism, the v3
+lesson, visible again in the measurement built to avoid it.
+
+### 2. Seeding a mode you cannot command: the reachability trap
+
+The design's Q3 routes crawl seeding through a new prone-locomotion PPO task,
+on the reasoning that a scripted probe cannot be an archive candidate — no
+open-loop posture survives a standing start here, so a probe must spawn prone
+while the archive spawns standing. Stage A' found an exception nobody had
+looked for: **five elites in v1's MAP-Elites CPG archive spawn standing, get
+themselves down, and crawl.** They had been filed as junk since j002 because
+the upright gate called them fallen. That is a crawl seed for the price of a
+distillation instead of a training run.
+
+Distilling them took four attempts, and the first three failures are worth
+more than the success, because each produced a log that looked fine.
+
+#### It is not a distillation problem. It is an action-space problem.
+
+The genome emits `tanh` and `JointPositionAction` runs at scale 1.0, so a
+genome can command **HOME +- 1 rad and nothing else**. The CPG's targets are
+bounded by the *soft joint limits*, which are wider. Measured over the five
+crawls:
+
+| genome | max \|delta from HOME\| | commands outside the genome's box |
+| --- | --- | --- |
+| `v1_cpg_175` | 1.93 rad (right ankle) | **15.2 %** |
+| `v1_cpg_277` | 1.92 rad (knees) | **24.1 %** |
+| `v1_cpg_169` | 1.83 rad (knees) | 20.7 % |
+| `v1_cpg_4` | 1.78 rad (knees) | 17.5 % |
+| `v1_cpg_6` | 1.57 rad (knees) | 21.5 % |
+
+A crawl folds its knees far past anything a walking-tuned action box allows.
+Distilling a teacher the student cannot command is not a hard optimisation
+problem, it is an impossible one — **and the symptom is the most misleading
+one available: near-perfect behaviour-cloning loss (0.0004-0.002) and a student
+that does not crawl.** Every diagnostic that looks at the loss says the
+distillation worked.
+
+The fix is to clip the teacher into the student's action space *first*, and
+then ask the honest question — is there still a crawl in there? For three of
+the five there is, and **two get better clipped**:
+
+| genome | free | clipped into the box |
+| --- | --- | --- |
+| `v1_cpg_4` | 0.500 | **1.000** |
+| `v1_cpg_169` | 0.891 | **0.992** |
+| `v1_cpg_277` | 1.000 | 0.953 |
+| `v1_cpg_175` | 1.000 | 0.000 |
+| `v1_cpg_6` | 0.422 | 0.000 |
+
+(per-replica P2' viability, 128 world-permuted replicas)
+
+Not a paradox: the clip caps the knee fold, and a less extreme gait is a more
+repeatable one.
+
+This also resolves a standoff between the two candidate teachers. The v1 CPG
+crawls have the **right spawn** (standing) and the **wrong action box**; the
+scripted probes have the right box — all five stay viable at 1.000 when
+clipped, losing ~10 % of their displacement — and the **wrong spawn** (prone).
+A *clipped* v1 crawl has both.
+
+#### DAgger needs an expert that can answer "given where you are"
+
+A CPG is a clock. It answers "at this time, do this" and cannot answer "given
+where you are, what would you do", which is precisely what DAgger asks of an
+expert on every round after the first. Once the student drifts out of phase,
+every label is wrong in a way more rounds cannot repair, because the labels
+themselves are mislabelled. Measured with the clock version: BC loss **0.0003
+on the teacher's states against 0.030 on the student's own**, a hundredfold gap
+that is the distribution shift made visible.
+
+Turning the clock into a state-conditioned expert — match the student's actual
+leg joint positions against the CPG's own target trajectory, label with the
+action at the phase the student has *reached* — cut the student-state loss
+19x, to 0.00157. Two details cost a run each:
+
+* **the tracker labels, it never drives.** The robot's joints lag the commanded
+  target, so a tracker allowed to drive compounds that lag into a slower gait:
+  the *teacher itself* went from +0.500 m to **-0.133 m**, turning the crawl
+  into a backwards shuffle;
+* **on round 0 the drive and the label are the same action.** Querying a
+  step-indexed teacher twice per step advances its clock twice and labels every
+  state with the action from the step *after* it — a seed lagging its teacher
+  by exactly one control step.
+
+#### What it produced, and the negative results next to it
+
+**One seed of five survives**: `v1_cpg_277` distils to 0.758 per-replica P2'
+viability at +0.246 m, unanimously labelled crawl, which the 5-of-8 insertion
+gate admits about 90 % of the time. Thin, and real.
+
+The DAgger-round count is **non-monotone**, which is worth knowing before
+reaching for more of them:
+
+| rounds | result |
+| --- | --- |
+| 1 (pure behaviour cloning) | all five ~0 viable |
+| **4** | **`v1_cpg_277` at 0.758**, rest 0 |
+| 8 | all five 0, *including* 277 |
+
+More rounds accumulate more bad labels in the bank, so the curve peaks and then
+falls. The phase-tracking lag calibration is the other thing not earning its
+place: it aliases badly — 27, 70, 122, 127, 148-170 control steps across runs,
+longer than the gait's own period — even though the diagnosis behind it was
+sound. Both are recorded because a future attempt will be tempted by each.
+
+**The generalisable version, for anyone distilling a teacher into a fixed
+policy class: check that the teacher's actions are inside the student's action
+space before you believe a loss curve.** A student that cannot express its
+teacher will report an excellent loss on the part it can express.
+
+### 3. Results — v4, all on medians over world-permuted replicas
+
+> Same warning as v2 and v3, and it still governs everything below. Every
+> number is a **median of 8 fresh world-permuted rollouts** per elite from a
+> verification pass independent of insertion, and an elite counts as verified
+> only if it cleared P2' in at least **5 of those 8** — the same k the
+> insertion gate uses, because insertion evidence has to match what
+> verification demands (j004's lesson, run in the other direction). The full
+> k = 1..8 sweep is printed for every mode, so a stricter reading is one
+> column away rather than a re-run.
+>
+> Cell counts are **resolvable**, re-binned at the resolution each mode's own
+> descriptor reproducibility supports. Quote the resolvable number: a cell
+> count on a grid finer than the measurement is a count of quantization.
+
+The run: 49 iterations x 1024 offspring x 8 replicas = **547,464 offspring
+evaluations in 4.6 h**, seeded with five distilled PPO walkers and one
+distilled crawl.
+
+| | v3 walk, re-verified under P2' | **v4 walk** | **v4 crawl** |
+| --- | --- | --- | --- |
+| elites raw | 356 | 263 | 58 |
+| elites verified | 301 | 234 | **58** |
+| archive robustness | 84.6 % | 89.0 % | **100.0 %** |
+| mean viable replicas | 0.763 | 0.758 | **0.963** |
+| resolvable grid | 7x9 = 63 | 6x8 = 48 | 20x20 = 400 |
+| **resolvable cells >= 0.25 m** | **57** | **41** | **42** |
+| saturation of the resolvable grid | 90.5 % | 85.4 % | 10.5 % |
+| best verified median | +2.322 m | +2.254 m | **+1.271 m** |
+| archive optimism | +0.263 m | +0.204 m | **+0.010 m** |
+| elites verifying as another mode | — | 12 (crawl) | 0 |
+
+**The headline: two modes, 83 resolvable cells of verified forward locomotion,
+where v3 had 57 cells of walking.** Crawl did not exist in any previous
+archive; it is now 58 elites, every one of which survives independent
+verification, at a best of **+1.271 m over 7 s — 18 cm/s, comparable to a
+mid-range walker and five times the 0.25 m bar the criterion asked for.**
+
+#### Walk regressed, and the arithmetic says by how much and why
+
+The pre-registered bar was **match or beat 57 resolvable cells**; v4 walk holds
+**41**. That is a miss, and it decomposes into two measured parts.
+
+**The bar was unreachable at this archive's own resolution.** v4 walk's
+resolvable grid is 6x8 = **48 cells**. 57 > 48, so no amount of coverage could
+have reached the bar — the archive fills 41 of the 48 cells its own descriptor
+reproducibility supports (85 %), against v3's 57 of 63 (90 %). The grid
+coarsened because the descriptor was measured more noisily here, and a coarser
+grid caps the achievable count before coverage is even in question.
+
+**And walk got half the search.** The per-mode parent budget (§ the hierarchy)
+splits GA parents evenly across non-empty modes, and crawl was non-empty from
+iteration 0 — so from the first iteration onward walk received **256 of 512
+parents** where v3's walk received all of them. v4's walk archive is the
+product of roughly half of v3's walking search: 263 raw elites against 356.
+
+That is not a bug; it is the trade the budget exists to make. Without it, 263
+walkers against 58 crawls would have given crawl 18 % of the parents instead of
+50 %, and the crawl archive above would not exist. **The honest summary is that
+v4 buys 42 crawl cells for 16 walk cells**, and whether that is a good trade is
+a judgement about what the archive is for, not a number.
+
+#### What the strictness sweep shows about the two modes
+
+| survives at least | walk elites | walk cells | crawl elites | crawl cells |
+| --- | --- | --- | --- | --- |
+| 1 of 8 | 251 | 41 | 58 | 42 |
+| **5 of 8** | **234** | **41** | **58** | **42** |
+| 6 of 8 | 180 | 40 | 56 | 41 |
+| 7 of 8 | 105 | 36 | 55 | 41 |
+| 8 of 8 | 36 | 24 | **46** | **33** |
+
+The two modes are not the same kind of object. **Crawl is nearly
+deterministic** — 58 of 58 verified at 5-of-8, still 46 at *unanimous* 8-of-8,
+and an archive optimism of **+0.010 m**, which is to say essentially none.
+Walking falls, crawling does not: walk drops from 234 to 36 elites between
+5-of-8 and 8-of-8.
+
+That is the measurement behind checkpoint 1's ruling. The relaxation from
+unanimous-8 to 5-of-8 was needed **for walk and only for walk**; the crawl
+sub-archive would have satisfied the design's original unanimous gate as
+written.
+
+#### Modes that stayed empty, and why
+
+* **roll — 0 elites, unseeded.** No roulade checkpoint exists on this machine
+  (`logs/` is gitignored and was not retained), and no scripted probe rotates:
+  over 129 swept variants the best supported world-horizontal rotation is
+  **0.22 rad/s** against the 0.8 rad/s the rule wants. v2 measured that
+  isotropic mutation cannot leave the manifold it starts on, so an unseeded
+  mode is expected empty **by search**. The physics question is left open, not
+  answered: a distilled roulade policy would settle it cheaply.
+* **hop — 0 elites, unseeded by design.** Appendix A measured a full-effort
+  scripted launch at 0.19-0.30 m/s against the 0.44 m/s a 1 cm hop needs. The
+  label exists so a bounding gait the search stumbles on is filed rather than
+  mislabelled; nothing stumbled on one.
+* **other — 0 elites, and this is the informative zero.** Across 547k
+  evaluations the classifier produced *no* viable behaviour it could not name.
+  The five-way partition is doing real work rather than using "other" as a
+  dumping ground for the awkward cases.
+
+#### The mechanisms, measured
+
+* **Incumbent re-testing** ran every iteration from the first, re-testing the
+  whole archive each time and **evicting 1,118 elites over the run**. Its own
+  pass rate (80-88 %) independently reproduces the 0.78 per-replica walker rate
+  the gate was calibrated from. At the end the archives' *running* pass rates
+  are **walk 0.938, crawl 0.996** — well above the 0.78 of the population they
+  were drawn from, which is the winner's curse being corrected rather than
+  measured after the fact. Archive optimism falls from v3's +0.263 m to
+  +0.204 m (walk) and +0.010 m (crawl).
+* **The per-mode parent budget** ended at `{crawl: 256, walk: 256}` with crawl
+  holding 58 elites against walk's 263. Without it crawl would have drawn 18 %
+  of parents; it drew 50 %.
+* **Mode integrity held.** Zero elites in either sub-archive failed the
+  label-agreement clause. Twelve of walk's 263 verify as *crawl* rather than
+  walk and are excluded from its verified count — a walker that reliably ends
+  up crawling is not a verified walker, and the classifier says so.
+
+#### Reproduction
+
+```bash
+# the shell contact fix, before and after
+uv run python -m qd.check_shell_contacts --out logs/qd/shell_contacts \
+    --sweep-friction 0.25 0.4 0.65 1.0
+
+# Stage A' - the predicate and classifier calibration (~25 min, cached per stage)
+uv run python -m qd.stage_a_prime --out logs/qd/stage_a_prime \
+    --seeds qd-run-archives/j004/seeds/ppo_seeds.npz \
+    --v3-archive qd-run-archives/j004/pga_me_v3/archive_final_verified.npz \
+    --v1-archives qd-run-archives/j003/qd/v1/pga_me_final.npz \
+    --v1-cpg-archive qd-run-archives/j003/qd/v1/map_elites_final.npz
+
+# the gate, pointed at things whose verdict is known in advance (no GPU)
+uv run python -m qd.check_knowns --out logs/qd/check_knowns
+
+# crawl seeds, distilled from v1's rescued CPG crawls (~8 min)
+uv run python -m qd.seed_crawl \
+    --archive qd-run-archives/j003/qd/v1/map_elites_final.npz \
+    --indices 4 169 277 175 6 --out logs/qd/seeds/crawl_seeds.npz
+uv run python -m qd.select_seeds --seeds logs/qd/seeds/crawl_seeds.npz \
+    --min-viable 0.5 --out logs/qd/seeds/crawl_seeds_viable.npz
+
+# the run: 49 x 1024 x 8 replicas = 547k offspring evaluations, 4.6 h
+uv run python -m qd.pga.run_modes --iterations 49 --batch-size 1024 \
+    --initial-solutions 1024 --insertion-replicas 8 --viable-min 5 \
+    --label-agreement-min 7 --retest-min-pass-rate 0.60 \
+    --seeding.jitter-count 240 \
+    --seed-genomes walk qd-run-archives/j004/seeds/ppo_seeds.npz \
+                   crawl logs/qd/seeds/crawl_seeds_viable.npz \
+    --td3.replay-buffer-size 2000000 --out-dir logs/qd/modes_v4
+
+# the honest numbers, the clips and the page
+MUJOCO_GL=glfw bash qd/finalize_v4.sh logs/qd/modes_v4/final logs/qd/v4
+
+# the v3 baseline the walk bar was set from
+uv run python -m qd.verify_modes --as-mode walk \
+    --archive qd-run-archives/j004/pga_me_v3/archive_final.npz \
+    --out logs/qd/v3_p2_baseline.npz
+```
+
 ## Watching the gaits
 
 ```bash

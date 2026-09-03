@@ -56,6 +56,18 @@ Never launch a long run without one.
   Every actuator/obs/reward selector uses `^(?!passive_).*` — keep the prefix
   convention when adding joints, and new `passive_` regexes must not
   accidentally match backlash joints (`^passive_.*wheel`, not `^passive_.*`).
+- **Ground-contact geoms are named by `robot/shell_contacts.py`, not by the
+  export.** `onshape-to-robot` names only the two soles, and `CollisionCfg`
+  addresses geoms by name — so before v4 the shells ran on MuJoCo's defaults
+  (condim 3, priority 0, mu 1) and the upper legs and trunk side shells had no
+  ground geom at all. Every `get_*_spec` now runs `prepare_contacts`, which
+  names every collision geom and adds the four missing ones. Two rules follow:
+  a robot geom must keep `priority >= 1` or the floor wins the friction mix and
+  the `mu` you wrote is not the one the solver uses; and shell friction is
+  `SHELL_FRICTION` (0.4, a PLA literature value, NOT a hardware measurement) with
+  `SHELL_FRICTION_RANGE` for DR. Anything resting on a shell — crawl, roll, fall
+  recovery — is sensitive to it. The rollers models deliberately opt out
+  (`collisions=()`).
 - **Actuators are BAM** (voltage-controlled XL330 model, friction computed by
   the actuator). Two consequences: any STANDALONE env cfg must register the
   `expand_bam_friction_fields` startup event, and joint-friction DR must scale

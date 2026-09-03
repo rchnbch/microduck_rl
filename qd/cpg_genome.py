@@ -140,6 +140,33 @@ def soft_leg_joint_limits(
     return mid - half, mid + half
 
 
+@lru_cache(maxsize=8)
+def joint_limits(names: tuple[str, ...]) -> tuple[np.ndarray, np.ndarray]:
+    """``(lo, hi)`` MJCF ranges of any named joints, in the order given.
+
+    The v4 probes drive all fourteen servos, not the ten the CPG genome covers,
+    so the clamp needs limits for the neck too."""
+    model = mujoco.MjModel.from_xml_path(str(MICRODUCK_WALK_XML))
+    lo = np.empty(len(names))
+    hi = np.empty(len(names))
+    for i, name in enumerate(names):
+        jnt_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        if jnt_id < 0:
+            raise KeyError(f"joint {name!r} not found in {MICRODUCK_WALK_XML}")
+        lo[i], hi[i] = model.jnt_range[jnt_id]
+    return lo, hi
+
+
+def soft_joint_limits(
+    names, factor: float = SOFT_LIMIT_FACTOR
+) -> tuple[np.ndarray, np.ndarray]:
+    """:func:`joint_limits` shrunk about the midpoint, as the entity cfg does."""
+    lo, hi = joint_limits(tuple(names))
+    mid = 0.5 * (lo + hi)
+    half = 0.5 * (hi - lo) * factor
+    return mid - half, mid + half
+
+
 def genome_space(
     freq_bounds: tuple[float, float] = FREQ_BOUNDS,
     amplitude_range_fraction: float = AMPLITUDE_RANGE_FRACTION,

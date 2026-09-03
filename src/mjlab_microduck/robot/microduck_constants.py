@@ -3,12 +3,14 @@ from pathlib import Path
 
 import mujoco
 from mjlab.actuator import XmlActuatorCfg
+from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
+from mjlab.utils.spec_config import CollisionCfg
+
 from mjlab_microduck.actuator import (
     BacklashEncoderBamActuatorCfg,
     FrictionDRBamActuatorCfg,
 )
-from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
-from mjlab.utils.spec_config import CollisionCfg
+from mjlab_microduck.robot.shell_contacts import prepare_contacts
 
 
 _ROBOT_DIR: Path = Path(os.path.dirname(__file__)) / "microduck"
@@ -37,15 +39,15 @@ assert MICRODUCK_ALLCOLLISIONS_ROLLERS_BACKLASH_XML.exists(), f"XML not found: {
 
 
 def get_walk_spec() -> mujoco.MjSpec:
-    return mujoco.MjSpec.from_file(str(MICRODUCK_WALK_XML))
+    return prepare_contacts(mujoco.MjSpec.from_file(str(MICRODUCK_WALK_XML)))
 
 
 def get_standup_spec() -> mujoco.MjSpec:
-    return mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_XML))
+    return prepare_contacts(mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_XML)))
 
 
 def get_ground_pick_spec() -> mujoco.MjSpec:
-    return mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_XML))
+    return prepare_contacts(mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_XML)))
 
 
 def get_walk_rollers_spec() -> mujoco.MjSpec:
@@ -59,11 +61,11 @@ def get_ball_spec() -> mujoco.MjSpec:
 
 
 def get_backlash_spec() -> mujoco.MjSpec:
-    return mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_BACKLASH_XML))
+    return prepare_contacts(mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_BACKLASH_XML)))
 
 
 def get_walk_backlash_spec() -> mujoco.MjSpec:
-    return mujoco.MjSpec.from_file(str(MICRODUCK_WALK_BACKLASH_XML))
+    return prepare_contacts(mujoco.MjSpec.from_file(str(MICRODUCK_WALK_BACKLASH_XML)))
 
 
 def get_rollers_backlash_spec() -> mujoco.MjSpec:
@@ -96,11 +98,48 @@ HOME_FRAME = EntityCfg.InitialStateCfg(
     joint_vel={".*": 0.0},
 )
 
+SHELL_FRICTION: float = 0.4
+"""Sliding friction of the printed shells against the floor.
+
+**Not a hardware measurement, and the honest label matters.** Nobody has put a
+Microduck shell on a force gauge; this is the mid-point of the published range
+for PLA sliding on a hard smooth floor (0.3-0.5 dry, PLA-on-PLA ~0.35, PLA on
+sealed wood ~0.45), and :data:`SHELL_FRICTION_RANGE` is deliberately wide
+enough to cover the surfaces a demo actually happens on. What it replaces is
+worse than a guess: every shell contact on this robot has been running
+MuJoCo's default ``mu = 1`` — printed plastic gripping the floor exactly as
+hard as the rubber soles — because ``FULL_COLLISION`` addressed geoms the
+export never named (see :mod:`mjlab_microduck.robot.shell_contacts`).
+
+Anything that rests on a shell — a crawl, a roll, a fall recovery — is
+sensitive to this number; ``qd.check_shell_contacts --sweep-friction`` reports
+the sensitivity so the choice is revisable against one measurement rather than
+baked into a policy.
+"""
+
+SHELL_FRICTION_RANGE: tuple[float, float] = (0.25, 0.65)
+"""Domain-randomization range for :data:`SHELL_FRICTION`.
+
+Wide on purpose: it spans the plausible floors (a carpeted stage grips, a
+lacquered table slides) and it is the only thing standing between a crawl
+policy and a systematic drag error, since the nominal is a literature value
+rather than a measurement. Wire it with
+:func:`mjlab_microduck.tasks.mdp.shell_friction_event_cfg`."""
+
+# Every ground-contact geom carries ``priority=1``. Without it MuJoCo mixes the
+# pair elementwise (``max`` for friction) and the floor's ``mu = 1`` wins, so
+# the number above would be written and never used. ``condim=3`` everywhere:
+# the ``condim=1`` this cfg used to ask for was a frictionless-shell idea that
+# never matched a geom, and a frictionless belly is the wrong model for a robot
+# whose crawl has to push off it.
 FULL_COLLISION = CollisionCfg(
     geom_names_expr=[".*_collision"],
-    condim={r"^(left|right)_foot_collision$": 3, ".*_collision": 1},
-    priority={r"^(left|right)_foot_collision$": 1},
-    friction={r"^(left|right)_foot_collision$": (1.0,)},
+    condim=3,
+    priority=1,
+    friction={
+        r"^(left|right)_foot_collision$": (1.0,),
+        r".*_collision": (SHELL_FRICTION,),
+    },
 )
 
 # -- Old actuator (XML position, MuJoCo built-in PD + friction) --

@@ -1591,6 +1591,100 @@ deliberately fold (standup, roulade, the crawl task to come) should expect a
 slightly larger self-collision reading and should be re-baselined rather than
 surprised.
 
+### 1. Stage A' — what calibrating a predicate actually measured
+
+`qd/measurements/stage_a_prime.md` is the artefact; this is what it says.
+
+**The probes had to be swept, not written.** Every hand-written crawl
+parameterisation crawled *backwards* (-0.05 to -0.24 m over 7 s) and no roll
+probe rotated. One probe per world makes a sweep cost what a single probe
+costs, so the whole (base x direction x frequency x amplitude) grid went
+through — 396 variants over six batched rollouts. The direction of travel of a
+drag gait is a property of its phase relationship, and it was a coin flip which
+way the hand-written guess pointed.
+
+**Roll does not roll open-loop.** Best supported world-horizontal rotation over
+129 swept roll variants: **0.22 rad/s** against the 0.8 rad/s the rule wants.
+The roll threshold is therefore **uncalibrated** — there is no roll cluster to
+place it against — and stays at the design's arithmetic (one revolution per
+episode) until a distilled roulade checkpoint gives it a member.
+
+**A threshold that cut through a real behaviour.** The design's initial
+`hop_air_min = 0.10` runs straight through the measured crawl cluster, whose
+per-window `f_air` reaches 0.130 on the over-driven chin drag: two genuine
+crawls flipped crawl<->hop between windows and failed the label clause in
+19-29 % of replicas. Raised to **0.16**, which is the design's own remedy for
+this case, and reported as **one-sided** — hop is dropped and has no cluster to
+bound the threshold from above.
+
+#### Chaos per mode, and why it decides everything else
+
+| mode | probes | median displacement | mean replica sd |
+| --- | --- | --- | --- |
+| crawl | 9 | +0.384 m | **0.0028 m** |
+| roll | 3 | -0.053 m | 0.0026 m |
+| **walk** | 11 | +1.430 m | **0.5591 m** |
+
+Walking is **200x more chaotic** than an open-loop crawl, reproducing v2's
+0.605 m. Every awkward number below follows from this one.
+
+#### The pre-registered bars were not met, and the reason is structural
+
+The bar was positives >= 0.95 and negatives <= 0.05 **per replica**. Over 16
+calibration positives and 1661 negatives (292 v1 MLP divers, 340 v1 CPG elites,
+1024 random MLPs, 5 scripted degenerates), **no setting in the grid cleared
+both**. The five that reach >= 0.95 everywhere are the five scripted crawls, at
+1.000. The eleven that never do are the eleven walk positives.
+
+Clause breakdown at W = 2 s, d_min = 0.05 m — every failure is the *progress*
+clause, none is `finite`:
+
+| probe | viable | progress | label | median displacement |
+| --- | --- | --- | --- | --- |
+| walk_seed_0 | 0.227 | 0.227 | 1.000 | 0.190 m |
+| walk_seed_1..5 | 0.71-0.81 | 0.71-0.81 | 1.000 | 0.68-1.43 m |
+| v3_elite_0..4 | 0.71-0.80 | 0.78-0.81 | 0.87-0.98 | 1.72-2.09 m |
+| the five tuned crawls | **1.000** | **1.000** | **1.000** | 0.38-0.72 m |
+
+**A Microduck walker passes P2' about 0.78 of the time per replica, because a
+Microduck walker falls.** v3 independently measured mean per-elite survival at
+**0.883** under the *upright* gate; P2' is a little stricter because it also
+demands sustained progress. Loosening `d_min` to 0.02 raises walk only to
+0.72-0.84 — the grid does not control what they fail on.
+
+So the bar is achievable by a near-deterministic open-loop crawl and
+unachievable by any closed-loop walker on this simulator. That is a property of
+the robot, not of the predicate, and no threshold was moved to hide it.
+
+#### The negatives that passed were not a hole. They were crawls.
+
+Five v1 CPG elites clear P2' at W = 2, d_min = 0.05. Re-run at **128
+world-permuted replicas**:
+
+| genome | viable | label | agreement | window constancy | median dx | sd | f_body | p95 \|a_z\| |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **v1_cpg_175** | **1.000** | crawl | 1.000 | 1.000 | **+0.543 m** | 0.0018 m | 0.789 | 6.1 |
+| **v1_cpg_277** | **1.000** | crawl | 1.000 | 1.000 | **+0.359 m** | 0.0057 m | 0.914 | 3.1 |
+| v1_cpg_169 | 0.859 | crawl | 1.000 | 1.000 | +0.306 m | 0.0159 m | 0.923 | 4.0 |
+| v1_cpg_4 | 0.594 | crawl | 1.000 | 1.000 | +0.447 m | 0.0193 m | 0.874 | 5.9 |
+| v1_cpg_6 | 0.461 | crawl | 1.000 | 1.000 | +0.320 m | 0.0131 m | 0.871 | 4.2 |
+
+They spawn **standing at HOME**, get themselves down, and travel 0.31-0.54 m on
+their shells with gentle impacts — the same range as the hand-tuned scripted
+crawls, and further than three of them. **These have been in v1's MAP-Elites
+archive since j002, filed as junk because the upright gate called them fallen.**
+
+The design says a negative that passes is either a genuine mode or a hole in
+the predicate, and must be reported by name either way. These are genuine, and
+they are the first crawls anyone has found on this robot. They are 31-D CPG
+genomes, so seeding the v4 archive with them needs the same behaviour-cloning
+distillation `qd.seed` already runs for the PPO walker — but unlike a scripted
+probe they start standing, so the distillation is well-posed.
+
+One more thing they show: the 8-replica estimate had all five at 1.000, and at
+128 replicas three of them fell to 0.46-0.86. Small-sample optimism, the v3
+lesson, visible again in the measurement built to avoid it.
+
 ## Watching the gaits
 
 ```bash

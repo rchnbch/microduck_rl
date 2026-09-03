@@ -149,6 +149,11 @@ class Args:
     by default — incumbent re-testing with eviction, below."""
 
     retest_fraction: float = 0.1
+    """Floor on the share of the archive re-tested per iteration.
+
+    A floor rather than a target: the rollout batch is a fixed-size CUDA graph,
+    so re-testing 20 incumbents costs exactly what re-testing 500 costs, and
+    the batch is filled. See :meth:`qd.hierarchy.ModeArchives.sample_incumbents`."""
     retest_min_pass_rate: float = 0.60
     """Eviction threshold for an elite's running pass rate.
 
@@ -499,7 +504,7 @@ def main(args: Args | None = None) -> None:
 
         # --- incumbent re-test ---------------------------------------------- #
         retest = RetestOutcome()
-        sample = archives.sample_incumbents(args.retest_fraction, rng)
+        sample = archives.sample_incumbents(args.retest_fraction, rng, num_envs)
         if sample:
             block = torch.as_tensor(
                 np.stack([g for _m, _c, g in sample]),

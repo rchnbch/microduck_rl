@@ -250,13 +250,25 @@ class ModeArchives:
     # -- incumbent re-testing ----------------------------------------------- #
 
     def sample_incumbents(
-        self, fraction: float, rng: np.random.Generator
+        self,
+        fraction: float,
+        rng: np.random.Generator,
+        capacity: int | None = None,
     ) -> list[tuple[str, int, np.ndarray]]:
-        """A random ``fraction`` of the archive, as ``(mode, cell, genome)``.
+        """Incumbents to re-test, as ``(mode, cell, genome)``.
 
         Sampled across all modes together, so the re-test budget follows where
         the elites actually are rather than taxing a five-elite mode as heavily
-        as a three-hundred-elite one."""
+        as a three-hundred-elite one.
+
+        ``capacity`` is the rollout batch size, and passing it is close to free
+        money. The batch is a fixed-size CUDA graph: re-testing 20 incumbents
+        costs one full batch of rollouts and so does re-testing 500. The design
+        budgeted "a tenth of the archive per iteration, about +12 %"; measured
+        here, a tenth *is* a full batch, so the tenth is a floor and the batch
+        is filled. Same wall clock, ~25x the evidence per elite, and the
+        running pass rate the eviction rule reads converges that much faster.
+        """
         pool: list[tuple[str, int, np.ndarray]] = []
         for mode, archive in self.archives.items():
             data = archive.data(return_type="dict")
@@ -265,6 +277,8 @@ class ModeArchives:
         if not pool:
             return []
         k = max(1, round(fraction * len(pool)))
+        if capacity:
+            k = max(k, min(capacity, len(pool)))
         pick = rng.choice(len(pool), size=min(k, len(pool)), replace=False)
         return [pool[i] for i in pick]
 

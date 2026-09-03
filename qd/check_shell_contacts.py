@@ -370,7 +370,10 @@ def friction_sweep(args: Args) -> dict:
     from qd.evaluate import HarnessCfg, MicroduckRolloutHarness
 
     results = {}
-    probe = probes.by_name("crawl_belly_push")
+    # The tuned chin drag, not the hand-written one: the hand-written probes
+    # crawl backwards, and a sensitivity measured on a probe that does not
+    # crawl says nothing about how much crawling depends on shell friction.
+    probe = probes.by_name("crawl_chin_drag_tuned")
     for mu in args.sweep_friction:
         harness = MicroduckRolloutHarness(
             HarnessCfg(
@@ -385,7 +388,11 @@ def friction_sweep(args: Args) -> dict:
         feats, _ = probes.run_probe(harness, probe, spawn.get(probe.spawn))
         results[f"mu={mu:g}"] = {
             "median_displacement_m": round(float(np.median(feats.displacement)), 4),
+            "worst_window_m": round(
+                float(np.median(feats.window_dx[1:].min(axis=0))), 4
+            ),
             "f_body": round(float(np.median(feats.f_body)), 3),
+            "p95_az": round(float(np.median(feats.p95_az)), 2),
         }
         harness.close()
     return results

@@ -1542,6 +1542,30 @@ of the published range for PLA on a hard smooth floor, with
 than baked into a policy. What it replaces is worse than a guess: printed
 plastic gripping the floor exactly as hard as the rubber soles.
 
+#### How much does the number matter? (`--sweep-friction`)
+
+The best scripted crawl (`crawl_chin_drag_tuned`, 64 replicas), re-run at four
+shell frictions:
+
+| shell mu | displacement / 7 s | worst 2 s window | f_body | p95 \|a_z\| |
+| --- | --- | --- | --- | --- |
+| 0.25 (DR floor) | +0.749 m | 0.215 m | 0.719 | 11.4 |
+| **0.40 (nominal)** | **+0.725 m** | **0.214 m** | 0.731 | 11.3 |
+| 0.65 (DR ceiling) | +0.582 m | 0.167 m | 0.721 | 12.1 |
+| **1.00 (the legacy default)** | **+0.293 m** | **0.084 m** | 0.823 | 12.7 |
+
+Two readings, and the second is the important one.
+
+Across the DR range the crawl varies by ~25 % — so *within* the uncertainty the
+literature value carries, the choice is not critical, which is what makes it
+tolerable to ship a cited number instead of a measured one.
+
+At the **legacy** mu = 1.0 the same crawl travels **2.5x less**, and its worst
+2 s window falls to 0.084 m — **below the calibrated `d_min` of 0.10 m**. On the
+model v1-v3 ran, the best scripted crawl is *not viable under P2'*. The shell
+contact model is not a tidy-up: it is the difference between crawl existing and
+crawl not existing.
+
 #### The cost, stated: self-collision goes up
 
 Naming the shells makes them addressable; adding the thigh and side-shell geoms

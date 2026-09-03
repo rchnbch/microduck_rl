@@ -1794,6 +1794,167 @@ policy class: check that the teacher's actions are inside the student's action
 space before you believe a loss curve.** A student that cannot express its
 teacher will report an excellent loss on the part it can express.
 
+### 3. Results — v4, all on medians over world-permuted replicas
+
+> Same warning as v2 and v3, and it still governs everything below. Every
+> number is a **median of 8 fresh world-permuted rollouts** per elite from a
+> verification pass independent of insertion, and an elite counts as verified
+> only if it cleared P2' in at least **5 of those 8** — the same k the
+> insertion gate uses, because insertion evidence has to match what
+> verification demands (j004's lesson, run in the other direction). The full
+> k = 1..8 sweep is printed for every mode, so a stricter reading is one
+> column away rather than a re-run.
+>
+> Cell counts are **resolvable**, re-binned at the resolution each mode's own
+> descriptor reproducibility supports. Quote the resolvable number: a cell
+> count on a grid finer than the measurement is a count of quantization.
+
+The run: 49 iterations x 1024 offspring x 8 replicas = **547,464 offspring
+evaluations in 4.6 h**, seeded with five distilled PPO walkers and one
+distilled crawl.
+
+| | v3 walk, re-verified under P2' | **v4 walk** | **v4 crawl** |
+| --- | --- | --- | --- |
+| elites raw | 356 | 263 | 58 |
+| elites verified | 301 | 234 | **58** |
+| archive robustness | 84.6 % | 89.0 % | **100.0 %** |
+| mean viable replicas | 0.763 | 0.758 | **0.963** |
+| resolvable grid | 7x9 = 63 | 6x8 = 48 | 20x20 = 400 |
+| **resolvable cells >= 0.25 m** | **57** | **41** | **42** |
+| saturation of the resolvable grid | 90.5 % | 85.4 % | 10.5 % |
+| best verified median | +2.322 m | +2.254 m | **+1.271 m** |
+| archive optimism | +0.263 m | +0.204 m | **+0.010 m** |
+| elites verifying as another mode | — | 12 (crawl) | 0 |
+
+**The headline: two modes, 83 resolvable cells of verified forward locomotion,
+where v3 had 57 cells of walking.** Crawl did not exist in any previous
+archive; it is now 58 elites, every one of which survives independent
+verification, at a best of **+1.271 m over 7 s — 18 cm/s, comparable to a
+mid-range walker and five times the 0.25 m bar the criterion asked for.**
+
+#### Walk regressed, and the arithmetic says by how much and why
+
+The pre-registered bar was **match or beat 57 resolvable cells**; v4 walk holds
+**41**. That is a miss, and it decomposes into two measured parts.
+
+**The bar was unreachable at this archive's own resolution.** v4 walk's
+resolvable grid is 6x8 = **48 cells**. 57 > 48, so no amount of coverage could
+have reached the bar — the archive fills 41 of the 48 cells its own descriptor
+reproducibility supports (85 %), against v3's 57 of 63 (90 %). The grid
+coarsened because the descriptor was measured more noisily here, and a coarser
+grid caps the achievable count before coverage is even in question.
+
+**And walk got half the search.** The per-mode parent budget (§ the hierarchy)
+splits GA parents evenly across non-empty modes, and crawl was non-empty from
+iteration 0 — so from the first iteration onward walk received **256 of 512
+parents** where v3's walk received all of them. v4's walk archive is the
+product of roughly half of v3's walking search: 263 raw elites against 356.
+
+That is not a bug; it is the trade the budget exists to make. Without it, 263
+walkers against 58 crawls would have given crawl 18 % of the parents instead of
+50 %, and the crawl archive above would not exist. **The honest summary is that
+v4 buys 42 crawl cells for 16 walk cells**, and whether that is a good trade is
+a judgement about what the archive is for, not a number.
+
+#### What the strictness sweep shows about the two modes
+
+| survives at least | walk elites | walk cells | crawl elites | crawl cells |
+| --- | --- | --- | --- | --- |
+| 1 of 8 | 251 | 41 | 58 | 42 |
+| **5 of 8** | **234** | **41** | **58** | **42** |
+| 6 of 8 | 180 | 40 | 56 | 41 |
+| 7 of 8 | 105 | 36 | 55 | 41 |
+| 8 of 8 | 36 | 24 | **46** | **33** |
+
+The two modes are not the same kind of object. **Crawl is nearly
+deterministic** — 58 of 58 verified at 5-of-8, still 46 at *unanimous* 8-of-8,
+and an archive optimism of **+0.010 m**, which is to say essentially none.
+Walking falls, crawling does not: walk drops from 234 to 36 elites between
+5-of-8 and 8-of-8.
+
+That is the measurement behind checkpoint 1's ruling. The relaxation from
+unanimous-8 to 5-of-8 was needed **for walk and only for walk**; the crawl
+sub-archive would have satisfied the design's original unanimous gate as
+written.
+
+#### Modes that stayed empty, and why
+
+* **roll — 0 elites, unseeded.** No roulade checkpoint exists on this machine
+  (`logs/` is gitignored and was not retained), and no scripted probe rotates:
+  over 129 swept variants the best supported world-horizontal rotation is
+  **0.22 rad/s** against the 0.8 rad/s the rule wants. v2 measured that
+  isotropic mutation cannot leave the manifold it starts on, so an unseeded
+  mode is expected empty **by search**. The physics question is left open, not
+  answered: a distilled roulade policy would settle it cheaply.
+* **hop — 0 elites, unseeded by design.** Appendix A measured a full-effort
+  scripted launch at 0.19-0.30 m/s against the 0.44 m/s a 1 cm hop needs. The
+  label exists so a bounding gait the search stumbles on is filed rather than
+  mislabelled; nothing stumbled on one.
+* **other — 0 elites, and this is the informative zero.** Across 547k
+  evaluations the classifier produced *no* viable behaviour it could not name.
+  The five-way partition is doing real work rather than using "other" as a
+  dumping ground for the awkward cases.
+
+#### The mechanisms, measured
+
+* **Incumbent re-testing** ran every iteration from the first, re-testing the
+  whole archive each time and **evicting 1,118 elites over the run**. Its own
+  pass rate (80-88 %) independently reproduces the 0.78 per-replica walker rate
+  the gate was calibrated from. At the end the archives' *running* pass rates
+  are **walk 0.938, crawl 0.996** — well above the 0.78 of the population they
+  were drawn from, which is the winner's curse being corrected rather than
+  measured after the fact. Archive optimism falls from v3's +0.263 m to
+  +0.204 m (walk) and +0.010 m (crawl).
+* **The per-mode parent budget** ended at `{crawl: 256, walk: 256}` with crawl
+  holding 58 elites against walk's 263. Without it crawl would have drawn 18 %
+  of parents; it drew 50 %.
+* **Mode integrity held.** Zero elites in either sub-archive failed the
+  label-agreement clause. Twelve of walk's 263 verify as *crawl* rather than
+  walk and are excluded from its verified count — a walker that reliably ends
+  up crawling is not a verified walker, and the classifier says so.
+
+#### Reproduction
+
+```bash
+# the shell contact fix, before and after
+uv run python -m qd.check_shell_contacts --out logs/qd/shell_contacts \
+    --sweep-friction 0.25 0.4 0.65 1.0
+
+# Stage A' - the predicate and classifier calibration (~25 min, cached per stage)
+uv run python -m qd.stage_a_prime --out logs/qd/stage_a_prime \
+    --seeds qd-run-archives/j004/seeds/ppo_seeds.npz \
+    --v3-archive qd-run-archives/j004/pga_me_v3/archive_final_verified.npz \
+    --v1-archives qd-run-archives/j003/qd/v1/pga_me_final.npz \
+    --v1-cpg-archive qd-run-archives/j003/qd/v1/map_elites_final.npz
+
+# the gate, pointed at things whose verdict is known in advance (no GPU)
+uv run python -m qd.check_knowns --out logs/qd/check_knowns
+
+# crawl seeds, distilled from v1's rescued CPG crawls (~8 min)
+uv run python -m qd.seed_crawl \
+    --archive qd-run-archives/j003/qd/v1/map_elites_final.npz \
+    --indices 4 169 277 175 6 --out logs/qd/seeds/crawl_seeds.npz
+uv run python -m qd.select_seeds --seeds logs/qd/seeds/crawl_seeds.npz \
+    --min-viable 0.5 --out logs/qd/seeds/crawl_seeds_viable.npz
+
+# the run: 49 x 1024 x 8 replicas = 547k offspring evaluations, 4.6 h
+uv run python -m qd.pga.run_modes --iterations 49 --batch-size 1024 \
+    --initial-solutions 1024 --insertion-replicas 8 --viable-min 5 \
+    --label-agreement-min 7 --retest-min-pass-rate 0.60 \
+    --seeding.jitter-count 240 \
+    --seed-genomes walk qd-run-archives/j004/seeds/ppo_seeds.npz \
+                   crawl logs/qd/seeds/crawl_seeds_viable.npz \
+    --td3.replay-buffer-size 2000000 --out-dir logs/qd/modes_v4
+
+# the honest numbers, the clips and the page
+MUJOCO_GL=glfw bash qd/finalize_v4.sh logs/qd/modes_v4/final logs/qd/v4
+
+# the v3 baseline the walk bar was set from
+uv run python -m qd.verify_modes --as-mode walk \
+    --archive qd-run-archives/j004/pga_me_v3/archive_final.npz \
+    --out logs/qd/v3_p2_baseline.npz
+```
+
 ## Watching the gaits
 
 ```bash

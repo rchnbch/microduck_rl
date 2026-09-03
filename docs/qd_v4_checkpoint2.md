@@ -140,15 +140,94 @@ against 50 of 1024, and the bar (≥1.5 m) is cleared.
 
 ---
 
-## 6. Budget, and the plan for checkpoint 3
+## 6. Budget — measured, not extrapolated
 
-*(measured, filled in below from a 2-iteration run at the full batch)*
+The 512-batch run gives 252 s/iteration. Scaling that linearly to 1024 would
+say 504 s and a 6.8–8.5 h full run. **That extrapolation is wrong**, and v3's
+ledger already said so — batch size is nearly free on this box (64 → 2048
+worlds only doubles generation time). So it was measured instead: two
+iterations at the full batch.
+
+| | batch 512 | **batch 1024** |
+| --- | --- | --- |
+| iteration 0 (seeds + random init) | 256 s | 325 s |
+| per iteration | 252 s | **316 s** (309, 324) |
+| offspring evals / iteration | 4104 | **8200** |
+| feasibility | 44.6–64.1 % | 64.9–65.4 % |
+
+Doubling the batch costs 1.25×, not 2×. The re-test is already priced in: it
+pads to a full batch whether it re-tests 100 incumbents or 1000, so 316 s is
+the **steady-state** number rather than an early-iteration one.
+
+### Projection for the remaining work
+
+| item | cost |
+| --- | --- |
+| crawl seed distillation (5 CPG teachers × 4 DAgger rounds, 128 envs) | **~8 min** |
+| full multi-modal run, 400k offspring evals (49 iterations) | **4.3 h** |
+| full multi-modal run, 500k offspring evals (61 iterations) | **5.4 h** |
+| final 8-replica P2' verification, ~1000 elites across sub-archives | **~35 min** |
+| rendering + viewer | ~20 min |
+| **total, checkpoints 3–4** | **~5.5–6.5 h** |
+
+That is inside the spec's 6–10 h envelope. For scale: v3 spent 2.03 h on
+426k evaluations; v4 is ~2.1× dearer per evaluation, and the whole of that is
+the incumbent re-test doubling the rollouts per iteration. It is buying the
+thing v3 named as its clearest negative result, and §5 shows it working —
+optimism halved, 179 elites evicted in 8 iterations.
+
+**Recommendation: 400k offspring evals (49 iterations at batch 1024).** The
+smoke run's insertion rate was already down to 20 % by iteration 8, and v3's
+full run added only 26 verified elites between its budget-matched snapshot and
+its final one. I would rather spend the margin on checkpoint 4's verification
+and on a second seeded mode than on iterations 50–61.
+
+---
+
+## 7. The roll seed is blocked on a missing artefact — a decision for HQ
+
+Q3 routes the roll seed through "distil the best roulade checkpoint". **There
+is no roulade checkpoint on this machine.** `logs/` is gitignored and was not
+retained; the only surviving trained artefact from the earlier jobs is the
+already-distilled `ppo_seeds.npz` in `qd-run-archives/j004`. wandb is not
+authenticated in this session, so I cannot look for one there either — and I
+am not going to ask for credentials.
+
+This is not the physics conversation the spec anticipated for checkpoint 3. It
+is a missing file. Three ways forward:
+
+1. **Alex runs `wandb login`, or points me at a roulade run path**, and I distil
+   it as planned. Cost: ~10 min. By far the best outcome if the run exists.
+2. **Train the roulade task fresh.** The cfg exists and encodes a five-run
+   lesson arc. AGENTS.md budgets curriculum-heavy tasks at 4000–6000 iterations
+   — **4–6.5 h**, which pushes the job to 10–13 h and past the envelope.
+3. **Ship roll unseeded and report the account**, which the acceptance criterion
+   explicitly permits: *"≥3 verified roll cells OR a measured account of why the
+   roll archive is thin/empty (physics vs search, with numbers)."* The account
+   is already measured: no open-loop probe exceeds **0.22 rad/s** of supported
+   world-horizontal rotation against the 0.8 rad/s rule over 129 swept
+   variants, and v2 measured that isotropic mutation cannot leave the feasible
+   manifold it starts on — so an unseeded roll sub-archive is expected empty by
+   *search*, with the physics question left open rather than answered.
+
+**My recommendation: (1) if it is cheap for Alex, otherwise (3).** Option 2
+spends more than half the remaining budget on the mode the design already rates
+"high risk", and it would come out of the crawl work, which is the mode that is
+demonstrably real.
+
+Note that crawl is unaffected — its seed exists and needed no training run at
+all, which is the checkpoint-1 finding paying for itself.
+
+---
 
 ## Status against checkpoint-2 criteria
 
 * P2' gate, classifier, hierarchical archives, per-mode parent budget,
-  incumbent re-testing, progress-minus-impact critic: **implemented**, 331
-  tests, changed files ruff-clean. ✅
-* Every known negative fails, exceptions named: ✅
+  incumbent re-testing, progress-minus-impact critic: **implemented**, 335
+  tests green, changed files ruff-clean. ✅
+* Every known negative fails, five exceptions named and explained: ✅
 * Every known walker passes and labels as walk: ✅
 * Walk-only run reproduces a healthy sub-archive, feasibility in band: ✅
+* Budget projected from measurement: ✅ (§6)
+
+**Ready for checkpoint 3 on crawl.** Blocked on the roll seed pending §7.

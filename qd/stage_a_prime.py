@@ -988,8 +988,8 @@ def write_markdown(report: dict, path: Path) -> Path:
     )
     add("| --- | --- | --- | --- | --- | --- | --- | --- |")
     for name, v in report["classifier"]["per_probe"].items():
-        if v.get("source") == "v1_or_random":
-            continue
+        if v.get("source") in ("v1_or_random", "v1_cpg"):
+            continue  # ~1650 bulk negatives; their verdict is the sweep table
         add(
             f"| `{name}` | {v['intended_mode']} | {v['modal_label']} | "
             f"{v['replica_agreement']:.2f} | {v['window_constancy']:.2f} | "

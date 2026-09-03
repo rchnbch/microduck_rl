@@ -454,10 +454,20 @@ class PolicyRolloutHarness:
             accel_reward = VerticalAccel(self.num_envs, self.device, self.control_dt)
             accel_reward.begin(self.robot.data.root_link_lin_vel_w)
         accel = None
+        # `mode_stats` may be a LIST: the Stage A' sweep needs the same rollout
+        # accumulated at three window lengths, and the physics does not depend
+        # on how it is windowed. Rolling once per setting tripled the cost of
+        # the sweep for nothing.
+        mode_stats = (
+            None
+            if mode_stats is None
+            else (list(mode_stats) if isinstance(mode_stats, (list, tuple)) else [mode_stats])
+        )
         if mode_stats is not None:
             from qd.modes import VerticalAccel
 
-            mode_stats.begin(self.base_pos())
+            for ms in mode_stats:
+                ms.begin(self.base_pos())
             accel = VerticalAccel(self.num_envs, self.device, self.control_dt)
             accel.begin(self.robot.data.root_link_lin_vel_w)
 
@@ -485,14 +495,16 @@ class PolicyRolloutHarness:
             if mode_stats is not None:
                 ch = self.mode_channels()
                 assert ch is not None and accel is not None
-                mode_stats.update(
-                    self.base_pos(),
-                    gravity,
-                    ch["contact_found"],
-                    ch["ang_vel_w"],
-                    trunk_az=accel.step(ch["lin_vel_w"]),
-                    contact_force=ch.get("contact_force"),
-                )
+                az = accel.step(ch["lin_vel_w"])
+                for ms in mode_stats:
+                    ms.update(
+                        self.base_pos(),
+                        gravity,
+                        ch["contact_found"],
+                        ch["ang_vel_w"],
+                        trunk_az=az,
+                        contact_force=ch.get("contact_force"),
+                    )
             alive = ~metrics.fallen
             just_fell = was_alive & ~alive
 
@@ -541,7 +553,12 @@ class PolicyRolloutHarness:
 
         fitness, measures, info = metrics.finalize()
         if mode_stats is not None:
-            info.update(mode_stats.finalize().to_info())
+            # One `info` per window setting, prefixed so a multi-window
+            # rollout comes back as `mode/...` for the first (the default the
+            # single-stats callers read) and `mode<W>/...` for the rest.
+            for i, ms in enumerate(mode_stats):
+                prefix = "mode/" if i == 0 else f"mode{i}/"
+                info.update(ms.finalize().to_info(prefix))
         transitions = None
         if collect and buf:
             stacks = [torch.stack(t) for t in zip(*buf)]  # each (T, N, ...)

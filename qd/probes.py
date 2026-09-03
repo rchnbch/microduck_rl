@@ -487,36 +487,46 @@ def run_probe_batch(
     windows = windows or WindowCfg(
         episode_seconds=harness.fitness.episode_seconds, control_dt=harness.control_dt
     )
-    stats = harness.make_mode_stats(windows)
+    # A dict of window configs accumulates all of them from ONE rollout: the
+    # physics does not depend on how it is windowed, and the Stage A' sweep
+    # needs three settings per probe. Rolling once per setting tripled the cost
+    # of the sweep for nothing.
+    many = isinstance(windows, dict)
+    cfgs = windows if many else {None: windows}
+    keys = sorted(cfgs, key=lambda k: (k is not None, k))
+    stats = [harness.make_mode_stats(cfgs[k]) for k in keys]
+    steps = max(cfgs[k].episode_steps for k in keys)
 
     harness.reset(pose)
     home = harness.spawn_servo_targets
     names = tuple(harness.servo_joint_names)
-    traj = trajectory(
-        probes_per_world, home, names, windows.episode_steps, harness.control_dt
-    )
+    traj = trajectory(probes_per_world, home, names, steps, harness.control_dt)
 
     for _ in range(round(settle_seconds / harness.control_dt)):
         harness.set_servo_targets(home)
         harness.step()
 
-    stats.begin(harness.base_pos())
+    for ms in stats:
+        ms.begin(harness.base_pos())
     accel = VerticalAccel(harness.num_envs, harness.device, harness.control_dt)
     accel.begin(harness.robot.data.root_link_lin_vel_w)
-    for k in range(windows.episode_steps):
+    for k in range(steps):
         harness.set_servo_targets(traj[k])
         harness.step()
         ch = harness.mode_channels()
         assert ch is not None
-        stats.update(
-            harness.base_pos(),
-            harness.projected_gravity(),
-            ch["contact_found"],
-            ch["ang_vel_w"],
-            trunk_az=accel.step(ch["lin_vel_w"]),
-            contact_force=ch.get("contact_force"),
-        )
-    return stats.finalize()
+        az = accel.step(ch["lin_vel_w"])
+        for ms in stats:
+            ms.update(
+                harness.base_pos(),
+                harness.projected_gravity(),
+                ch["contact_found"],
+                ch["ang_vel_w"],
+                trunk_az=az,
+                contact_force=ch.get("contact_force"),
+            )
+    out = {k: ms.finalize() for k, ms in zip(keys, stats)}
+    return out if many else out[None]
 
 
 def run_probe(harness, probe: Probe, pose=None, windows=None, settle_seconds: float = 0.4):

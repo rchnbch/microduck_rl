@@ -38,6 +38,7 @@ Run::
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -217,11 +218,9 @@ def scripted_results(args: Args) -> list[ProbeResult]:
     windows = _window_cfgs(args.episode_seconds, harness.control_dt)
     out: list[ProbeResult] = []
     for probe in probes.PROBES:
-        per_window: dict[float, ModeFeatures] = {}
-        for w, cfg in windows.items():
-            per_window[w] = probes.run_probe_batch(
-                harness, [probe] * harness.num_envs, spawn.get(probe.spawn), cfg
-            )
+        per_window = probes.run_probe_batch(
+            harness, [probe] * harness.num_envs, spawn.get(probe.spawn), windows
+        )
         out.append(
             ProbeResult(
                 name=probe.name,
@@ -264,11 +263,13 @@ def genome_results(args: Args) -> list[ProbeResult]:
             dtype=torch.float32,
             device=args.device,
         )
-        per_window = {}
-        for w, cfg in windows.items():
-            stats = harness.make_mode_stats(cfg)
-            _f, _m, info, _t = harness.rollout(block, collect=False, mode_stats=stats)
-            per_window[w] = ModeFeatures.from_info(info)
+        order = sorted(windows)
+        stats = [harness.make_mode_stats(windows[w]) for w in order]
+        _f, _m, info, _t = harness.rollout(block, collect=False, mode_stats=stats)
+        per_window = {
+            w: ModeFeatures.from_info(info, "mode/" if i == 0 else f"mode{i}/")
+            for i, w in enumerate(order)
+        }
         out.append(
             ProbeResult(name, mode, positive, source, per_window,
                         per_window[2.0].displacement)
@@ -309,16 +310,19 @@ def genome_results(args: Args) -> list[ProbeResult]:
             block = np.concatenate([block, np.repeat(block[:1], pad, axis=0)])
         block_t = torch.as_tensor(block, dtype=torch.float32, device=args.device)
         per_rep: dict[float, list[ModeFeatures]] = {w: [] for w in windows}
+        wkeys = sorted(windows)
         for _ in range(args.negative_replicas):
             order = torch.randperm(harness.num_envs, generator=generator, device=args.device)
             inv = torch.argsort(order).cpu().numpy()
-            for w, cfg in windows.items():
-                stats = harness.make_mode_stats(cfg)
-                _f, _m, info, _t = harness.rollout(
-                    block_t[order], collect=False, mode_stats=stats
+            stats = [harness.make_mode_stats(windows[w]) for w in wkeys]
+            _f, _m, info, _t = harness.rollout(
+                block_t[order], collect=False, mode_stats=stats
+            )
+            info = {k: v[inv] for k, v in info.items()}
+            for i, w in enumerate(wkeys):
+                per_rep[w].append(
+                    ModeFeatures.from_info(info, "mode/" if i == 0 else f"mode{i}/")
                 )
-                feats = ModeFeatures.from_info({k: v[inv] for k, v in info.items()})
-                per_rep[w].append(feats)
         for i, (name, _g) in enumerate(chunk):
             per_window = {
                 w: _stack_features([r for r in per_rep[w]], i) for w in windows
@@ -366,10 +370,10 @@ def cpg_negative_results(args: Args) -> list[ProbeResult]:
             block = np.concatenate(
                 [block, np.repeat(block[:1], harness.num_envs - keep, axis=0)]
             )
-        per_window = {}
-        for w, cfg in windows.items():
-            stats = harness.make_mode_stats(cfg)
-            per_window[w] = evaluator.evaluate_with_modes(block, stats)
+        wkeys = sorted(windows)
+        stats = [harness.make_mode_stats(windows[w]) for w in wkeys]
+        by_index = evaluator.evaluate_with_modes(block, stats)
+        per_window = {w: by_index[i] for i, w in enumerate(wkeys)}
         for i in range(keep):
             feats = {w: _select(per_window[w], i) for w in windows}
             out.append(
@@ -406,29 +410,44 @@ def _stack_features(reps: list[ModeFeatures], idx: int) -> ModeFeatures:
 # --------------------------------------------------------------------------- #
 
 
-def split_positives(results: list[ProbeResult]) -> tuple[list[str], list[str]]:
-    """Positives that move forward at all, and those that do not.
+def split_positives(
+    results: list[ProbeResult], d_min: float = 0.05, window: float = 3.0
+) -> tuple[list[str], list[str]]:
+    """Positives that sustain forward progress, and those that do not.
 
     A probe labelled "crawl" that travels -0.13 m is not a positive example of
-    forward locomotion; it is a failed guess at how to crawl, and including it
-    in "worst positive" would make every calibration setting look equally bad
-    for a reason that has nothing to do with the predicate.
+    forward locomotion; it is a failed guess at how to crawl. Including it in
+    "worst positive" makes every calibration setting look equally bad for a
+    reason that has nothing to do with the predicate being calibrated.
 
-    The split is mechanical — median displacement over replicas > 0 — and the
-    excluded names are reported. This is the §6.3 case "a positive probe fails
-    P2' at every (W, d_min)": the mode does not move forward under *this*
-    open-loop parameterisation, which is a physics answer about the probe, not
-    a reason to move a bar.
+    The rule is mechanical and stated: **median worst-window displacement at
+    the most forgiving window length must clear ``d_min``**. Not "ends up
+    ahead" — the first version of this used total displacement and admitted
+    ``tuck_and_flop``, which lurches +0.05 m once and then lies still, i.e.
+    exactly the front-loaded profile P2' exists to exclude. A probe that cannot
+    sustain progress at W = 3 s cannot sustain it anywhere, and calibrating a
+    *sustained-progress* predicate against it is incoherent.
+
+    Excluded names are reported with their numbers. This is the §6.3 case "a
+    positive probe fails P2' at every (W, d_min)": the mode does not move
+    forward under *this* open-loop parameterisation — a physics answer about
+    the probe, not a reason to move a bar.
     """
     moving, stuck = [], []
     for r in results:
         if not r.positive:
             continue
-        (moving if float(np.median(r.displacement)) > 0.0 else stuck).append(r.name)
+        feats = r.features.get(window, r.features[2.0])
+        worst = float(np.median(feats.window_dx[1:].min(axis=0)))
+        (moving if worst >= d_min else stuck).append(r.name)
     return moving, stuck
 
 
-def predicate_sweep(results: list[ProbeResult], classifier: ClassifierCfg) -> dict:
+def predicate_sweep(
+    results: list[ProbeResult],
+    classifier: ClassifierCfg,
+    impact_cap: float | None = None,
+) -> dict:
     """Per-replica P2' pass rate for every probe at every (W, d_min)."""
     moving, _stuck = split_positives(results)
     rows: dict[str, dict] = {}
@@ -439,6 +458,7 @@ def predicate_sweep(results: list[ProbeResult], classifier: ClassifierCfg) -> di
                 windows=WindowCfg(window_seconds=w, stride_seconds=stride),
                 classifier=classifier,
                 d_min=d_min,
+                impact_cap=impact_cap,
             )
             per_probe = {}
             for r in results:
@@ -461,8 +481,38 @@ def predicate_sweep(results: list[ProbeResult], classifier: ClassifierCfg) -> di
     return rows
 
 
+def _setting_params(key: str) -> tuple[float, float]:
+    return (
+        float(key.split(",")[0].split("=")[1]),
+        float(key.split("d_min=")[1]),
+    )
+
+
 def choose_setting(sweep: dict) -> dict:
-    """The (W, d_min) with the largest positive/negative margin that clears both bars."""
+    """The **strictest** (W, d_min) that clears both bars; margin as the fallback.
+
+    The design says to choose the setting maximising the margin between the
+    worst positive and the best negative. That criterion does not survive
+    contact with a probe set it separates cleanly, and this one it does: once
+    every negative is at 0, the margin *is* the worst positive's pass rate, so
+    "maximise the margin" reduces to "pick whichever setting the positives like
+    best" — which is always the most permissive one. Measured here, seven of
+    nine settings tie at a margin of 1.0, and the maximum would have selected
+    W = 3 s (0.033 m/s sustained) over W = 2 s at d_min = 0.10 (0.05 m/s),
+    i.e. the weaker predicate, on a difference of 0.008 in a number that has
+    stopped discriminating.
+
+    So the rule applied is: among settings that clear both bars (positives
+    >= 0.95, negatives <= 0.05 per replica), take the one demanding the
+    **highest sustained speed** ``d_min / W``, breaking ties toward the shorter
+    window because a shorter window is harder to satisfy at the same rate. If
+    no setting clears both bars, fall back to the largest margin — and in that
+    case the honest reading is that the bars were not met, which is a finding
+    and not a setting.
+
+    The whole sweep is reported either way, so this choice is revisable against
+    the numbers rather than on trust.
+    """
     clearing = {
         k: v
         for k, v in sweep.items()
@@ -471,11 +521,25 @@ def choose_setting(sweep: dict) -> dict:
         and v["positives_at_or_above_0.95"] == v["positives"]
         and v["negatives_at_or_below_0.05"] == v["negatives"]
     }
-    pool = clearing or sweep
-    best = max(pool, key=lambda k: (pool[k]["margin"] or -1e9))
+    if clearing:
+        best = max(
+            clearing,
+            key=lambda k: (
+                _setting_params(k)[1] / _setting_params(k)[0],
+                -_setting_params(k)[0],
+            ),
+        )
+        rule = "strictest: highest d_min / W, then shorter W"
+    else:
+        best = max(sweep, key=lambda k: (sweep[k]["margin"] or -1e9))
+        rule = "largest margin (no setting cleared both bars)"
+    w, d = _setting_params(best)
     return {
         "setting": best,
         "cleared_both_bars": bool(clearing),
+        "settings_clearing_both_bars": sorted(clearing),
+        "required_speed_m_per_s": d / w,
+        "selection_rule": rule,
         **{k: v for k, v in sweep[best].items() if k != "per_probe"},
     }
 
@@ -600,6 +664,109 @@ def threshold_margin(clusters: dict, feature: str, lo_mode: str, hi_mode: str,
     }
 
 
+def calibrate_classifier(
+    results: list[ProbeResult],
+    calibration: list[str],
+    base: ClassifierCfg,
+    window: float = 2.0,
+    margin_sds: float = 5.0,
+) -> dict:
+    """Move any threshold that cuts through a measured cluster, and say so.
+
+    §6.3: *"Labels are unstable on a positive probe. The mode boundary runs
+    through a real behaviour; move the threshold, or merge the modes, and
+    re-measure."* That is this function, and the case it fires on is measured:
+    the draft's initial ``hop_air_min = 0.10`` runs straight through the crawl
+    cluster, whose per-window ``f_air`` reaches 0.093 on the over-driven chin
+    drag. Two genuine crawls therefore flip crawl <-> hop between windows and
+    fail P2' clause 3 at a rate of 19-29 %.
+
+    The honest complication: **there is no hop cluster to place the threshold
+    against.** Hop is dropped by design (Q1) and Appendix A measured the
+    physics as out of reach, so no positive hop probe exists or can exist. The
+    threshold is therefore **one-sided** — set above every measured
+    crawl/walk window with ``margin_sds`` replica standard deviations of
+    clearance, and *uncalibrated from above*. That is reported rather than
+    hidden, because a one-sided threshold is a weaker object than the
+    midpoint-between-clusters the design asks for, and a future hop seed would
+    have to re-measure it.
+
+    Raising it admits no negative: the one degenerate that clears clauses 2-3
+    (``thrash``) is excluded by the impact cap, not by the hop rule.
+    """
+    per_probe = {r.name: r for r in results}
+    members = [per_probe[n] for n in calibration if n in per_probe]
+    if not members:
+        return {"changed": False, "reason": "no calibration positives"}
+
+    window_air = np.concatenate(
+        [r.features[window].window_f_air[1:].reshape(-1) for r in members]
+    )
+    window_body = np.concatenate(
+        [r.features[window].window_f_body[1:].reshape(-1) for r in members]
+    )
+    air_sd = float(
+        np.mean([np.std(r.features[window].f_air) for r in members])
+    )
+    body_sd = float(
+        np.mean([np.std(r.features[window].f_body) for r in members])
+    )
+    air_max = float(window_air.max())
+    body_min = float(window_body.min())
+
+    proposed_air = float(np.ceil((air_max + margin_sds * max(air_sd, 0.005)) * 100) / 100)
+    report = {
+        "window": window,
+        "calibration_probes": [r.name for r in members],
+        "measured": {
+            "max_window_f_air_over_positives": air_max,
+            "mean_replica_sd_f_air": air_sd,
+            "min_window_f_body_over_positives": body_min,
+            "mean_replica_sd_f_body": body_sd,
+        },
+        "hop_air_min": {
+            "was": base.hop_air_min,
+            "now": proposed_air,
+            "one_sided": True,
+            "why": (
+                "no hop cluster exists to bound it from above: hop is dropped "
+                "(Q1) and Appendix A measured the takeoff speed at 0.19-0.30 "
+                "m/s against the 0.44 m/s a 1 cm hop needs. Set above every "
+                f"measured crawl/walk window ({air_max:.3f}) plus "
+                f"{margin_sds:g} replica sds ({air_sd:.4f})."
+            ),
+            "cuts_through_a_measured_cluster": base.hop_air_min <= air_max,
+        },
+        "crawl_body_min": {
+            "was": base.crawl_body_min,
+            "now": base.crawl_body_min,
+            "margin_sds_below_cluster": (
+                (body_min - base.crawl_body_min) / max(body_sd, 1e-6)
+            ),
+            "why": (
+                "unchanged: the crawl cluster's lowest window sits "
+                f"{body_min:.3f} against a threshold of {base.crawl_body_min}, "
+                "which is clearance, not a cut."
+            ),
+        },
+        "roll_rate_min": {
+            "was": base.roll_rate_min,
+            "now": base.roll_rate_min,
+            "calibrated": False,
+            "why": (
+                "UNCALIBRATED. No probe rotates: the best supported "
+                "world-horizontal rotation over 129 swept roll variants is "
+                "0.22 rad/s against the 0.8 rad/s rule. The value stays as the "
+                "draft's arithmetic (one revolution per 7 s episode) until a "
+                "distilled roulade checkpoint gives the roll cluster a member."
+            ),
+        },
+    }
+    report["changed"] = proposed_air != base.hop_air_min
+    report["calibrated"] = dataclasses.replace(base, hop_air_min=proposed_air)
+    return report
+
+
 # --------------------------------------------------------------------------- #
 # 4. Chaos per mode
 # --------------------------------------------------------------------------- #
@@ -638,13 +805,36 @@ def main(args: Args | None = None) -> None:
         results += cached("genomes", args, genome_results)
         results += cached("cpg", args, cpg_negative_results)
 
-    sweep = predicate_sweep(results, classifier)
+    moving, stuck = split_positives(results)
+
+    # Pass 1: thresholds. A classifier threshold that cuts through a measured
+    # cluster is a bad viability rule, because clause 3 reads the labels.
+    calibration = calibrate_classifier(results, moving, classifier)
+    if calibration.get("changed"):
+        classifier = calibration["calibrated"]
+
+    # Pass 2: clauses 2-3 only, to find which negatives get that far.
+    sweep_no_cap = predicate_sweep(results, classifier)
+    chosen_no_cap = choose_setting(sweep_no_cap)
+    w = float(chosen_no_cap["setting"].split(",")[0].split("=")[1])
+    d = float(chosen_no_cap["setting"].split("d_min=")[1])
+
+    # Pass 3: the cap, derived from the positives, then the sweep re-run with
+    # it. Sweeping with a cap derived from the same sweep would be circular;
+    # this is the design's own order (6.2-1 then 6.2-2).
+    impact = impact_cap_report(results, classifier, w, d)
+    cap = impact["cap"] if impact["cap_earns_its_place"] else None
+    sweep = predicate_sweep(results, classifier, impact_cap=cap)
     chosen = choose_setting(sweep)
     w = float(chosen["setting"].split(",")[0].split("=")[1])
     d = float(chosen["setting"].split("d_min=")[1])
 
-    moving, stuck = split_positives(results)
     report = {
+        "classifier_calibration": {
+            k: v for k, v in calibration.items() if k != "calibrated"
+        },
+        "predicate_sweep_before_cap": sweep_no_cap,
+        "impact_cap_applied": cap,
         "calibration_positives": moving,
         "positives_that_do_not_move_forward": {
             r.name: {
@@ -668,7 +858,7 @@ def main(args: Args | None = None) -> None:
         ],
         "predicate_sweep": sweep,
         "chosen": chosen,
-        "impact": impact_cap_report(results, classifier, w, d),
+        "impact": impact,
         "classifier": classifier_report(results, classifier),
         "chaos": chaos_report(results),
     }
@@ -707,7 +897,15 @@ def _print(report: dict, args: Args) -> None:
         )
     print(f"   calibration positives: {len(report['calibration_positives'])}")
 
-    print("\n=== 1. predicate sweep (per-replica pass rate) ===")
+    cal = report["classifier_calibration"]
+    if cal.get("changed"):
+        print("\n=== classifier thresholds, calibrated from the clusters ===")
+        for key in ("hop_air_min", "crawl_body_min", "roll_rate_min"):
+            row = cal[key]
+            print(f"   {key}: {row['was']} -> {row['now']}")
+            print(f"      {row['why']}")
+
+    print("\n=== 1. predicate sweep (per-replica pass rate, cap applied) ===")
     print(f"   {'setting':22s} {'worst pos':>10s} {'best neg':>9s} {'margin':>8s} "
           f"{'pos>=.95':>9s} {'neg<=.05':>9s}")
     for k, v in report["predicate_sweep"].items():
@@ -722,6 +920,11 @@ def _print(report: dict, args: Args) -> None:
         )
     c = report["chosen"]
     print(f"\n   chosen: {c['setting']}  cleared both bars: {c['cleared_both_bars']}")
+    print(
+        f"   {len(c.get('settings_clearing_both_bars', []))} settings cleared both "
+        f"bars; selected by {c['selection_rule']} "
+        f"({c['required_speed_m_per_s'] * 100:.1f} cm/s sustained)"
+    )
 
     print("\n=== 2. impact cap ===")
     imp = report["impact"]

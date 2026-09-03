@@ -64,13 +64,56 @@ from qd.seed import SeedCfg
 
 
 class CpgTeacher:
-    """An open-loop CPG genome, presented as the ``actor(obs)`` DAgger wants.
+    """An open-loop CPG genome, presented as the state-conditioned expert DAgger needs.
 
-    Stateful on purpose: a CPG's output depends on the step index and not on
-    the observation, so the counter lives here and :meth:`reset` is called
-    before every rollout. Returns **actions**, i.e. deltas from HOME in the
-    env's own joint order, because that is what the student emits and what
-    ``JointPositionAction`` consumes.
+    **The naive version of this does not work, and the reason is worth keeping.**
+    A CPG is a *clock*: its action is a function of time, not of state. Handing
+    DAgger a clock breaks its central assumption — the expert must be able to
+    answer "given where you are, what would you do", and a clock can only answer
+    "at this time, do this". The moment the student drifts out of phase, every
+    label is wrong in a way more rounds cannot fix, because the labels
+    themselves are mislabelled. Measured with the clock version, over 4 rounds:
+
+    | | teacher states | student states |
+    | --- | --- | --- |
+    | BC loss | 0.0003 | **0.030** (100x) |
+    | ``v1_cpg_175`` displacement | +0.500 m (teacher) | **+0.227 m** |
+    | P2' viability | — | **0.000** |
+
+    So the clock is turned into a state-conditioned expert by **phase
+    tracking**: at each step the student's actual leg joint positions are
+    matched against the CPG's own target trajectory, and the label is the
+    action at the *matched* phase rather than at the wall-clock step. A student
+    that lags gets labelled with what the teacher does at the point the student
+    has actually reached, which is what DAgger needs and what makes the expert
+    a function of state again.
+
+    The search is a **local, forward window** around the previous match rather
+    than a global argmin. A CPG target is periodic, so a global match on
+    position alone is ambiguous — it can jump half a cycle and label the
+    student with the opposite half of the stroke. A window that may slip
+    backward one step and advance up to ``max_advance`` keeps the phase
+    monotone and cheap.
+
+    Two details that cost a run each to find:
+
+    * **The tracker labels; it never drives.** The robot's joints *lag* the
+      commanded target (4-step command lag plus a low-kp servo), so matching a
+      live pose against the target trajectory always lands behind the command.
+      Used to drive, that lag compounds into a slower gait — measured, the
+      teacher itself went from +0.500 m to **-0.133 m**, i.e. the tracker
+      turned a crawl into a backwards shuffle. Round 0 therefore drives by the
+      clock, which is exactly the open-loop gait the archive verified.
+    * **The lag is measured, not guessed.** While the teacher drives round 0,
+      the tracker runs passively and records ``step - matched_phase``; its
+      median is the pipeline's true lag. Labels on later rounds are then
+      ``delta[matched_phase + lag + 1]`` — "what the teacher would command
+      next, for a robot whose pose is here" — rather than ``delta[phase + 1]``,
+      which would ask the student to chase a target it is already behind.
+
+    Returns **actions**, i.e. deltas from HOME in the env's own joint order,
+    because that is what the student emits and what ``JointPositionAction``
+    (``target = HOME + action``, scale 1.0) consumes.
     """
 
     def __init__(
@@ -79,12 +122,19 @@ class CpgTeacher:
         harness: PolicyRolloutHarness,
         control_dt: float,
         action_dim: int = 14,
+        phase_tracking: bool = True,
+        max_advance: int = 4,
+        back_slip: int = 1,
     ):
         from qd import cpg_genome
         from qd.evaluate import cpg_target_trajectory
 
         self.control_dt = control_dt
         self.action_dim = action_dim
+        self.phase_tracking = phase_tracking
+        self.max_advance = max_advance
+        self.back_slip = back_slip
+        self.harness = harness
         device = harness.device
 
         joint_names = list(harness.robot.joint_names)
@@ -94,27 +144,79 @@ class CpgTeacher:
         home = harness.robot.data.default_joint_pos[:1].clone()  # (1, nj)
         self._home_legs = home[:, self._leg_ids]
 
-        steps = round(harness.fitness.episode_seconds / control_dt) + 4
+        steps = round(harness.fitness.episode_seconds / control_dt) + max_advance + 2
         times = torch.arange(steps, dtype=torch.float32, device=device) * control_dt
         g = torch.as_tensor(
             np.atleast_2d(genome), dtype=torch.float32, device=device
         )
-        # (T, 1, 10) absolute leg targets -> (T, 10) deltas from HOME
-        traj = cpg_target_trajectory(g, times)[:, 0, :]
-        self._delta = traj - self._home_legs
+        # (T, 1, 10) absolute leg targets -> (T, 10), and its delta from HOME
+        self._target = cpg_target_trajectory(g, times)[:, 0, :]
+        self._delta = self._target - self._home_legs
         self._step = 0
+        self._phase: torch.Tensor | None = None
+        self.lag: int = 0
+        self._lag_samples: list[float] = []
 
     def reset(self) -> None:
         self._step = 0
+        self._phase = None
 
-    def __call__(self, obs: torch.Tensor) -> torch.Tensor:
-        k = min(self._step, self._delta.shape[0] - 1)
-        self._step += 1
+    def calibrate_lag(self) -> int:
+        """Median ``step - matched_phase`` seen while the teacher drove."""
+        if self._lag_samples:
+            self.lag = round(float(np.median(self._lag_samples)))
+        return self.lag
+
+    def _match_phase(self, n: int) -> torch.Tensor:
+        """Per-env phase index, from where the robot's legs actually are."""
+        device = self._target.device
+        if self._phase is None:
+            self._phase = torch.zeros(n, dtype=torch.long, device=device)
+            return self._phase
+        legs = self.harness.robot.data.joint_pos[:, self._leg_ids]  # (N, 10)
+        offsets = torch.arange(
+            -self.back_slip, self.max_advance + 1, device=device
+        )
+        cand = (self._phase.unsqueeze(1) + offsets.unsqueeze(0)).clamp(
+            0, self._target.shape[0] - 2
+        )  # (N, W)
+        # (N, W, 10) targets at each candidate phase, against the live pose
+        ref = self._target[cand]
+        dist = torch.linalg.vector_norm(ref - legs.unsqueeze(1), dim=-1)
+        self._phase = cand.gather(1, dist.argmin(dim=1, keepdim=True)).squeeze(1)
+        return self._phase
+
+    def _emit(self, obs: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
         action = torch.zeros(
             obs.shape[0], self.action_dim, device=obs.device, dtype=obs.dtype
         )
-        action[:, self._leg_ids] = self._delta[k].to(obs.dtype)
+        action[:, self._leg_ids] = delta.to(obs.dtype)
         return action
+
+    def drive(self, obs: torch.Tensor) -> torch.Tensor:
+        """The open-loop gait, by the clock — the behaviour the archive verified.
+
+        Also advances the phase tracker passively, so round 0 measures the lag
+        the labels on later rounds need."""
+        k = min(self._step, self._delta.shape[0] - 1)
+        if self.phase_tracking:
+            phase = self._match_phase(obs.shape[0])
+            self._lag_samples.append(float((k - phase).float().median()))
+        self._step += 1
+        return self._emit(obs, self._delta[k].expand(obs.shape[0], -1))
+
+    def label(self, obs: torch.Tensor) -> torch.Tensor:
+        """What the teacher would command next, for a robot whose pose is here."""
+        if not self.phase_tracking:
+            k = min(self._step, self._delta.shape[0] - 1)
+            self._step += 1
+            return self._emit(obs, self._delta[k].expand(obs.shape[0], -1))
+        phase = self._match_phase(obs.shape[0])
+        idx = (phase + self.lag + 1).clamp(max=self._delta.shape[0] - 1)
+        return self._emit(obs, self._delta[idx])
+
+    def __call__(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.drive(obs)
 
 
 @dataclass
@@ -129,6 +231,11 @@ class Args:
     seeding: SeedCfg = field(default_factory=SeedCfg)
     replicas: int = 32
     """World-permuted replicas used to score each distilled seed."""
+
+    phase_tracking: bool = True
+    """Label by the phase the student has REACHED, not by the wall clock.
+
+    Off reproduces the measured failure — see :class:`CpgTeacher`."""
 
     viability: ViabilityCfg = field(default_factory=ViabilityCfg)
     classifier: ClassifierCfg = field(default_factory=ClassifierCfg)
@@ -177,6 +284,10 @@ def distil_cpg(
             actor = lambda o, g=frozen: spec.forward(g.expand(o.shape[0], -1), o)
 
         _f, _m, info, _t = harness.rollout(collect=False, actor=actor, on_step=on_step)
+        if rnd == 0:
+            lag = teacher.calibrate_lag()
+            if verbose:
+                print(f"    measured pipeline lag: {lag} control steps", flush=True)
 
         raw = torch.cat(collected_lab)
         obs_bank.append(torch.cat(collected_obs))
@@ -223,7 +334,11 @@ class _Clock:
     The teacher is queried once per step to *label* the state, and on round 0
     it also *drives*. Calling it twice in one step would advance the clock
     twice and label every state with the next step's action, which is a subtle
-    off-by-one that shows up as a distillation that lags its teacher by 20 ms.
+    off-by-one that shows up as a distillation lagging its teacher by 20 ms.
+
+    On round 0 the drive and the label are the same action by construction —
+    the states being labelled are the ones the teacher itself produced — so the
+    driven action is cached and handed back rather than recomputed.
     """
 
     def __init__(self, teacher: CpgTeacher):
@@ -232,7 +347,7 @@ class _Clock:
         self._driving = False
 
     def drive(self, obs: torch.Tensor) -> torch.Tensor:
-        self._cached = self.teacher(obs)
+        self._cached = self.teacher.drive(obs)
         self._driving = True
         return self._cached
 
@@ -240,7 +355,7 @@ class _Clock:
         if self._driving and self._cached is not None:
             out, self._cached = self._cached, None
             return out
-        return self.teacher(obs)
+        return self.teacher.label(obs)
 
 
 def score(genome: torch.Tensor, harness, args: Args) -> dict:
@@ -291,7 +406,10 @@ def main(args: Args | None = None) -> None:
     for idx in args.indices:
         print(f"\ndistilling v1_cpg_{idx} ({args.seeding.rounds} DAgger rounds)",
               flush=True)
-        teacher = CpgTeacher(genomes[idx], harness, harness.control_dt)
+        teacher = CpgTeacher(
+            genomes[idx], harness, harness.control_dt,
+            phase_tracking=args.phase_tracking,
+        )
         genome, log = distil_cpg(teacher, harness, args.seeding, spec, generator)
         stats = score(genome, harness, args)
         seeds.append(genome)

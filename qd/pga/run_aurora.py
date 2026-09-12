@@ -118,6 +118,10 @@ class Args:
     reservoir: int = 20_000
     """Recent candidate feature rows kept for retraining (viable or not)."""
     search_centroids: int = 1024
+    refit_centroids_at: int = 2
+    """Iteration at which the search centroids are first refitted to the
+    viable candidates seen so far (same encoder, no retrain). 0 disables and
+    keeps the evaluation set's box-uniform centroids — attempt 1's setting."""
     train: TrainCfg = field(default_factory=TrainCfg)
 
     retest_fraction: float = 0.1
@@ -185,18 +189,65 @@ class Reservoir:
         self.size = size
         self.rng = rng
         self.groups: deque[np.ndarray] = deque(maxlen=2000)
+        self.viable_rows: deque[np.ndarray] = deque()
 
-    def add(self, verdict: ReplicaVerdict, stack: np.ndarray, viable_only_groups: bool = True) -> None:
+    def add(self, verdict: ReplicaVerdict, stack: np.ndarray) -> None:
         self.rows.append(verdict.features.astype(np.float32))
         self.count += len(verdict.features)
         while sum(len(r) for r in self.rows) > self.size and len(self.rows) > 1:
             self.rows.popleft()
-        # per-genome replica groups for noise calibration
+        # per-genome replica groups for noise calibration, and the viable
+        # candidates' median features for data-driven centroids
         for j in np.flatnonzero(verdict.viable):
             self.groups.append(stack[:, j])
+        if verdict.viable.any():
+            self.viable_rows.append(verdict.features[verdict.viable].astype(np.float32))
+            while sum(len(r) for r in self.viable_rows) > self.size and len(self.viable_rows) > 1:
+                self.viable_rows.popleft()
 
     def features(self) -> np.ndarray:
         return np.concatenate(list(self.rows)) if self.rows else np.zeros((0, 0), np.float32)
+
+    def viable_features(self) -> np.ndarray:
+        return (
+            np.concatenate(list(self.viable_rows))
+            if self.viable_rows else np.zeros((0, 0), np.float32)
+        )
+
+
+def search_centroids(space: BehaviourSpace, archive: LatentArchive, res: Reservoir, args: Args) -> np.ndarray:
+    """Centroids for the SEARCH archive: k-means on the latents of viable
+    candidates seen so far (plus the archive), falling back to the box CVT
+    when too few exist.
+
+    Attempt 1 of the long run used the evaluation set's box-uniform centroids
+    for the search too, and measured why that is wrong for a search archive:
+    the box spans the junk end of the manifold (random MLPs), so the known
+    modes are ~5 cells of walk and ~16 of crawl; at that resolution walkers
+    were evicted faster than five cells could hold them, and the archive was
+    15 cells and one walker by iteration 10. A data-driven CVT puts cells
+    where viable behaviour is (the standard CVT-MAP-Elites construction when
+    the reachable region is unknown), while the frozen EVALUATION centroids
+    stay box-uniform and untouched, so every reported number is still on the
+    pre-registered grid.
+    """
+    from sklearn.cluster import KMeans
+
+    arc = archive.data()["features"]
+    v = res.viable_features()
+    parts = [a for a in (arc, v) if len(a)]
+    x = np.concatenate(parts) if parts else np.zeros((0, 0))
+    k = args.search_centroids
+    if len(x) < k:
+        all_rows = res.features()
+        if len(all_rows):
+            bounds = latent_bounds(space.encode(all_rows))
+        else:
+            bounds = np.tile([[-3.0, 3.0]], (space.latent_dim, 1)).astype(np.float32)
+        return make_centroids(k, bounds, seed=args.seed)
+    z = space.encode(x)
+    km = KMeans(n_clusters=k, n_init=1, random_state=args.seed).fit(z)
+    return km.cluster_centers_.astype(np.float32)
 
 
 def retrain(space: BehaviourSpace, archive: LatentArchive, res: Reservoir, args: Args) -> tuple[BehaviourSpace, dict]:
@@ -209,9 +260,7 @@ def retrain(space: BehaviourSpace, archive: LatentArchive, res: Reservoir, args:
     groups = list(res.groups)
     if len(groups) >= 10:
         new.calibrate_to_noise(groups)
-    z = new.encode(x)
-    bounds = latent_bounds(z)
-    centroids = make_centroids(args.search_centroids, bounds, seed=args.seed)
+    centroids = search_centroids(new, archive, res, args)
     moved = archive.re_encode(new.encode, centroids)
     info = {"rows": len(x), "val_mse": new.train_info.get("val_mse"), **moved}
     return new, info
@@ -398,6 +447,13 @@ def main(args: Args | None = None) -> None:
 
         # --- AURORA retrain ------------------------------------------------- #
         retrain_info = None
+        if args.refit_centroids_at and it == args.refit_centroids_at:
+            moved = archive.re_encode(
+                search_space.encode, search_centroids(search_space, archive, reservoir, args)
+            )
+            radius = args.novelty_radius_cells * archive.centroid_spacing()
+            retrain_info = {"centroids_refit": moved, "radius": radius}
+            print(f"  refit search centroids to viable candidates: {retrain_info}", flush=True)
         if (
             args.retrain_every
             and it % args.retrain_every == 0

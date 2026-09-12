@@ -1990,6 +1990,403 @@ uv run python -m qd.verify_modes --as-mode walk \
     --out logs/qd/v3_p2_baseline.npz
 ```
 
+## Walking v5 — a learned behaviour space, so the modes are not named in advance
+
+v4 named its modes (`walk / crawl / hop / roll / other`) and then measured
+that the search contributed none of them: **mode count = seed count**. Over 50
+iterations and 547k rollouts, `roll`, `hop` and `other` read zero at every
+iteration, and the independent assessment that opened j017 found four
+mechanisms stacked against a new mode ever appearing — parents budgeted only
+across *non-empty* modes (an empty mode draws no parents, forever), `other`
+defined as the residual band between named clusters, a constant-label clause
+that kills whatever sits unstably between two names, and nothing that rewards
+novelty at all. Crawl, the one "second mode", was a single genome's frequency
+sweep: 4 of 20 height bins, 20 of 20 speed bins.
+
+v5 stops naming. The descriptor is learned from trajectory data
+(`qd/behaviour.py`, `qd/behaviour_space.py`), the archive is a CVT in that
+learned space (`qd/latent_archive.py`), parents come from everywhere with a
+bias *towards* sparse regions, and the encoder is retrained as the archive
+grows (`qd/pga/run_aurora.py`, AURORA-style). Everything is scored on one
+frozen evaluation space and one fixed centroid set (`qd/verify_aurora.py`),
+and v4's archive is re-embedded and scored identically, so "more diverse" is a
+claim that can be false.
+
+### 0. What v4 rejected — closing the instrumentation gap first
+
+v4 logged `per_mode` counts only for what it admitted. Whether a roll or a hop
+ever *appeared* and was then killed by the progress / constancy / agreement
+clauses was unrecorded. `run_modes.insert` now logs the modal label of every
+rejected candidate, and `qd/audit_rejections.py` regenerates a sample the way
+v4 did — GA isoline offspring from v4's final archives under v4's own parent
+budget — and keeps every per-replica verdict. Measured on 3,072 offspring x 8
+permuted replicas (24,576 rollouts):
+
+| | replicas | cleared label-free clauses | P2'-viable |
+| --- | --- | --- | --- |
+| labelled **roll** | **0** | 0 | 0 |
+| labelled **hop** | **0** | 0 | 0 |
+| labelled **other** | 614 (2.5 %) | 104 | **0** |
+| labelled crawl | 14,762 | 10,581 | 10,497 |
+| labelled walk | 9,200 | 6,955 | 6,862 |
+
+**Novel behaviours were absent, not suppressed.** Roll and hop never appeared
+in a single replica. "Other" appeared in 2.5 % of replicas, and the 104 that
+cleared the label-free clauses (finite, windowed progress, impact cap) *all*
+failed constancy — they were transitions (a walker going down mid-window, a
+crawl that stood up), not a stationary unnamed behaviour; no candidate had an
+"other"-labelled replica that was viable, let alone 5 of 8. Of 941 rejections,
+889 failed k-of-8 viability outright and **52 (5.5 %) died to the label
+machinery alone**, every one of them a walk- or crawl-labelled candidate whose
+label flipped in a fall. Caveat stated once: this is the GA channel from the
+*final* archive (no critic was saved, so PG offspring are not regenerated),
+and the admission rate is correspondingly high (69 %); it is representative of
+the exploration operator, not of the whole run. Artefact:
+`qd-run-archives/j017/audit_rejections/`.
+
+So the gates were not the whole problem. The search never produced anything
+new for them to kill, which is what the parent budget and the absence of
+novelty pressure predict, and which is what v5 changes.
+
+### 1. Design
+
+**Features (`qd/behaviour.py`).** Per rollout, an 80-D vector of
+order-invariant statistics over the scored 6 s (the first second is the
+stand-to-whatever transition and is exempt, as in v4): trunk-z mean/sd;
+projected-gravity mean/sd (3+3); v_x mean/sd, v_y mean/sd, v_z sd; world
+angular-rate mean/sd (3+3); per-joint position mean and sd (14+14); per-joint
+speed RMS (14); per-geom ground-contact fraction for all 14 ground-capable
+geoms; airborne fraction; mean contact count; mean |a_z|; and the dominant
+frequency and peak-power ratio of the trunk-z trace. Why statistics rather
+than the raw time series AURORA embeds: this simulator is measured chaotic
+(identical genomes spread sd 0.605 m in displacement, step timing
+decorrelates across replicas within a second), so a time-series embedding
+would put replica noise *into* the descriptor — the failure v3's Stage A found
+kills a grid. Means, sds and contact fractions describe the steady behaviour,
+not one realisation of it; `test_feature_vector_is_phase_invariant` locks that
+in.
+
+**Encoder (`qd/behaviour_space.py`).** A small autoencoder
+(80 → 64 → 32 → L → 32 → 64 → 80, ELU, MSE on standardised features, held-out
+early stopping), L = 4, with PCA at the same L as the linear control — if the
+AE does not separate v4's known modes better than its first four principal
+components the non-linearity has not earned its place, and the report says
+which was used. Latents are then **whitened in units of replica noise**: one
+unit along any axis is one sd of what world-permuted replicas of the same
+genome do (v3's spread-to-noise rule applied to a learned space). Dead
+features (a geom that never touches in the training set) are zeroed, not blown
+up.
+
+**Gate (P2'', `evaluate_viability_v5`).** P2' minus the label clause:
+finite, +x ≥ `d_min` = 0.05 m in every 2 s window from the second on, p95
+|a_z| ≤ 17 m/s² — v4's calibrated values, unchanged — and, in place of "one
+label across windows", a **stationarity** clause: consecutive scored windows
+may not change `f_body` or `f_air` by more than `delta_max`. That is what the
+label clause did physically (a late fall moves `f_body` by (7 − t_fall)/2 in
+the last window) without a mode name in it, and without killing a behaviour
+for sitting *between* two names. `delta_max` is calibrated on v4's verified
+elites' replicas and the value is stated with the checkpoint.
+
+**Archive (`qd/latent_archive.py`).** A CVT over the latent space: 1024
+centroids by k-means on uniform samples in the padded 1–99 % box of the
+training latents. No per-mode grids. **Parents are sampled from the whole
+archive with weight `1 / (1 + n_i)`**, `n_i` the number of other elites within
+two centroid-spacings — strictly positive for every elite, so no region that
+holds one can be starved (`LatentArchive.parent_weights`;
+`test_every_elite_has_positive_parent_weight_and_lonely_ones_more`). That
+weighting is the explicit novelty pressure. Incumbent re-testing with eviction
+at a 0.60 running pass rate is carried over from v4.
+
+> **Post-registration method change (2026-09-12, 19:05 CEST), recorded so the
+> result cannot be read as tuned.** The paragraph above originally applied the
+> *evaluation* centroids — box-uniform over the training latents — to the
+> search archive as well, and the long run was launched that way at 18:00
+> CEST. Attempt 1 measured why that is wrong for a search archive: the box
+> spans the junk end of the manifold, so the known modes are ~5 cells of walk
+> and ~16 of crawl, and at that resolution walkers were evicted (0.78
+> per-replica pass rate) faster than five cells could hold them. By iteration
+> 5 the archive was 25 cells with 3 walkers; **by iteration 10, 15 cells and 1
+> walker**, and the iteration-10 retrain merged 13 of 28 elites on
+> re-encoding. It was stopped at iteration 11 (1 h in; logs kept at
+> `qd-run-archives/j017/aurora_v5_attempt1/`) and restarted at 19:12 CEST with
+> **search centroids fitted by k-means to the latents of the viable candidates
+> seen so far** (refit at iteration 2 and at every retrain,
+> `run_aurora.search_centroids`) — the standard CVT-MAP-Elites construction
+> when the reachable region is unknown. HQ approved the restart on two
+> conditions, both met here: the change is recorded with the evidence, and no
+> further restart without a blocking report. **Nothing on the evaluation side
+> moved**: the frozen encoder, the 1,024 box-uniform evaluation centroids, the
+> mode rule, the 5-of-8 bar and predictions P1–P8 are as written above, so the
+> results are judged on exactly the grid pre-registered before either attempt.
+
+**Two spaces, one frozen.** The evaluation space is trained once on v4's
+final archives + their seeds + 512 jittered variants + 1024 random MLPs (1,868
+genomes x 8 permuted replicas, `qd/collect_behaviour.py`), its centroid set is
+generated once, and **every archive in this section is scored on those** —
+including v4, re-rolled under the same replicas and gate. The search starts
+from a copy and retrains its own encoder every 10 iterations on archive +
+reservoir features (not in the last 10, so the final archive was filled under
+one geometry), re-measures noise on recent viable candidates' replicas,
+regenerates its centroids and re-encodes the archive. The log records
+coverage on the *frozen* centroids every iteration; the search space's cell
+count is not a comparable number and is not quoted as one.
+
+**"Distinct mode", fixed in advance.** DBSCAN on the verified elites' frozen
+latents at `eps = 3 x noise`, `min_samples = 3`; a mode is a cluster of ≥ 5
+verified elites. For every mode the report gives its nearest-other-mode
+distance in units of eps, its occupancy across each latent axis (10 bins over
+the fixed box), its raw trunk-height / joint-speed / contact ranges, its
+robustness, and its composition under v4's labels (reporting only). A
+one-genome frequency sweep shows up as a mode that spans one raw axis and
+nothing else, and is reported as such.
+
+**Quality bar: viable in ≥ 5 of 8 world-permuted replicas**, insertion and
+verification alike (`--viable-min 5`, `--insertion-permute-worlds` default
+True, `qd/verify_aurora.py --viable-min 5`). Declared here, before any result;
+not moved. Every distance is a median over replicas. "Resolvable cells" does
+not appear as a metric anywhere in this section.
+
+### 2. Pre-registered predictions
+
+Written before the kill-gate checkpoint ran. The report at the end of this
+section is judged against these.
+
+| # | prediction | outcome |
+| --- | --- | --- |
+| P1 | The learned space, told nothing, recovers v4's walk and crawl as **≥ 2 distinct modes** on v4's own re-verified data, with **≥ 95 % purity** against v4's labels — for the AE *and* the PCA control. | **met** (§3, §4) |
+| P2 | v4's data yields **2–4 modes** in the learned space (walk may split into sub-gaits; no hidden mode the classifier missed). | **met** — 4 |
+| P3 | v5's final archive holds **at least one distinct mode that no v4 elite falls into** (nearest v4 elite further than eps from every member). Honest prior ~0.4 — v2 measured that mutation does not leave its manifold, and v5 changes the selection, not the operator. | **not met** |
+| P4 | Coverage of the fixed 1024 centroids by verified elites: **v5 ≥ 1.5 x v4**, whether or not P3 holds (novelty pressure spreads the known modes). | **met** — 2.0 x |
+| P5 | Aggregate robustness at 5-of-8 **≥ 85 %**; the walk-like mode ≥ 85 %, the crawl-like mode ≥ 95 %. | **met** — 98.9 / 89.3 / 99.7 % |
+| P6 | Best verified median displacement in the walk-like mode **≥ 1.5 m** (quality is not the target; this is the floor under "diversity first"). | **met** — +2.091 m |
+| P7 | The stationarity clause rejects **≤ 5 %** of the v4 elites' replicas that clear the other clauses at the calibrated `delta_max`. | **met** — 0.44 % |
+| P8 | The v5 run is **not** a seed-count archive: the mode count on the frozen space rises above the number at iteration 0 by iteration 25. | **not met in substance** |
+
+### 3. Kill-gate checkpoint — the space recovers walk and crawl without being told
+
+Dataset: 1,868 genomes x 8 world-permuted replicas (14,944 rows) —
+v4's final walk (263) and crawl (58) archives, their seeds (6 + 5), 512
+jittered variants at σ ∈ {0.005, 0.02, 0.05, 0.1}, and 1,024 random MLPs.
+Under P2'' at 5-of-8: v4 walk **224/263**, v4 crawl **57/58**, jitter
+120/512, random **0/1024**, crawl seeds 0/5 (as j007 measured: only
+`v1_cpg_277` was ever viable, and it is in the archive already).
+
+**The label-free gate is the label gate, measured.** The stationarity clause
+at `delta_max = 0.15` passes **99.56 %** of the v4 elites' replicas that clear
+the other clauses (p50 0.00, p95 0.05, p99 0.08; the 0.44 % above are the
+0.5-deltas of genuine late falls). Verified counts under P2'' equal the counts
+under P2' exactly (224 and 57). **P7 holds** (≤ 5 %).
+
+**Encoders.** AE, L = 4: held-out MSE **0.108** in standardised units (train
+0.092), 400 epochs. PCA at L = 4 explains 63.0 % of variance, reconstruction
+MSE 0.360 — 3.3x worse. Two dead features (the lower-leg geoms never touch
+the ground in this dataset) are zeroed. After noise whitening the spread-to-
+noise ratio per latent axis is **5.8 / 10.8 / 6.8 / 6.7** (AE) and 10.2 /
+14.6 / 5.7 / 2.9 (PCA). Replica noise, measured on 406 viable genomes'
+viable replicas: **1.68** (AE), 1.65 (PCA) — so eps = 5.04 / 4.95.
+
+**v4 re-embedded, frozen AE space, 1,024 fixed centroids, 5-of-8:**
+
+| | AE | PCA (control) |
+| --- | --- | --- |
+| verified elites | 281 / 321 (87.5 %) — walk 85.2 %, crawl 98.3 % | same |
+| coverage, verified | **21 / 1024** (walk 5, crawl 16) | 15 / 1024 |
+| modes (DBSCAN, eps = 3 x noise, ≥ 5 elites) | **4** | 4 |
+| purity vs v4 labels | **100 %** in every mode | 100 % |
+| min inter-mode distance / eps | 2.8 | 3.0 |
+
+Mode composition in the AE space:
+
+| mode | elites | v4 label | trunk z [m] | joint speed [rad/s] | median +x [m] | latent axis bins (of 10) | nearest mode / eps |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 224 | walk 224 | 0.116–0.123 | 1.08–2.80 | 0.61–2.19 | 2, 2, 3, 2 | 4.95 |
+| 1 | 22 | crawl 22 | 0.052–0.057 | 0.92–2.84 | 0.30–1.02 | 2, 3, 2, 2 | 2.80 |
+| 2 | 16 | crawl 16 | 0.051–0.054 | 1.66–3.94 | 0.55–1.21 | 2, 2, 3, 3 | 2.80 |
+| 3 | 5 | crawl 5 | 0.054–0.056 | 4.39–4.64 | 0.84–1.30 | 1, 1, 2, 2 | 5.61 |
+
+**Verdict.** Told nothing, both the AE and its linear control put every walker
+in one cluster and every crawler in another, with no mixing (**P1 holds**, for
+both). The count is 4, inside P2's 2–4, and the extra two are honest about
+what they are: crawl splits along **joint speed** (0.9–2.8 / 1.7–3.9 /
+4.4–4.6 rad/s) at essentially the same trunk height (0.051–0.057 m) — the
+one-genome frequency sweep the assessment described, cut into three pieces by
+a 3-noise threshold. The per-axis table shows it: modes 1–3 each span 1–3
+bins of 10 on every axis, and mode 3 is 5 elites in a 1-bin blob. **This is
+exactly the case the pre-registered rule was built to expose, and the rule
+does expose it** — a count of 4 is reported as *2 postures, one of them a
+3-piece speed sweep*, not as four modes, and the same reading will be applied
+to v5.
+
+Two things this measurement says about the run to come:
+
+* the space has resolution to spare — walk's 224 elites occupy 5 of 1,024
+  cells, crawl's 57 occupy 16. The centroid set spans the whole training box,
+  most of which is junk (random MLPs), so the known modes are small; coverage
+  will be read as a fraction of the same 1,024 for every archive and never
+  summed with anything else;
+* the AE space is the evaluation space (pre-declared default, and its
+  reconstruction is 3.3x better at the same L). PCA agreeing on the
+  separation is the control that says the separation is in the data, not in
+  the non-linearity.
+
+Smoke run of the full v5 loop (3 iterations x 256, one encoder retrain):
+see `qd-run-archives/j017/aurora_smoke/`.
+
+Artefacts: `qd-run-archives/j017/space_eval/` (`space_ae.npz`,
+`space_pca.npz`, `centroids_ae.npz`, `checkpoint.json`, latent scatter
+plots), `qd-run-archives/j017/behaviour_data.npz`.
+
+### 4. Results — v5 against v4, same frozen space, same 1,024 centroids, same 5-of-8 bar
+
+> Every number below is from `qd/verify_aurora.py`: 8 fresh world-permuted
+> replicas per elite, verified = P2'' in ≥ 5 of 8, fitness = median
+> displacement, descriptor = the frozen AE's latent of the median feature
+> vector, coverage on the fixed centroid set, modes by the pre-registered
+> DBSCAN rule. v4's walk and crawl archives were re-rolled as one set under
+> exactly the same procedure. "Resolvable cells" appears nowhere.
+
+The run: 49 iterations x 1024 offspring x 8 replicas = **742,368 evaluations
+in 4.6 h** (attempt 2; attempt 1 is recorded in §1), seeded with the same
+five distilled PPO walkers and one distilled crawl v4 had.
+
+| | **v4** (walk + crawl, re-verified) | **v5** |
+| --- | --- | --- |
+| filed / verified at 5-of-8 | 321 / 287 (**89.4 %**) | 981 / 970 (**98.9 %**) |
+| — walk-like mode | 263 / 230 (87.5 %) | 75 / 67 (89.3 %) |
+| — crawl-like mode(s) | 58 / 57 (98.3 %) | 906 / 903 (99.7 %) |
+| strictness sweep k = 5 / 6 / 7 / 8 | 287 / 235 / 172 / 85 | 970 / 945 / 909 / 838 |
+| **coverage of the fixed 1,024 centroids (verified)** | **20** (2.0 %) | **40** (3.9 %) |
+| — cells shared / only here | 15 shared | 5 only v4 · 25 only v5 |
+| modes (DBSCAN, eps = 3 x noise, ≥ 5 elites) | **4** | **2** |
+| min inter-mode distance / eps | 3.05 | 5.94 |
+| best verified median, walk-like | **+2.338 m** | +2.091 m |
+| best verified median, crawl-like | +1.279 m | +1.161 m |
+| archive optimism (filed − verified median) | +0.114 m | **+0.015 m** |
+| median of medians, whole archive | 1.347 m | 0.611 m |
+
+Mode table, both archives, one rule:
+
+| archive | mode | elites | cells | robustness (filed→verified) | mean viable replicas | latent axis bins (of 10) | trunk z [m] | joint speed [rad/s] | f_air | contacts | best median | v4 label |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| v4 | 0 | 230 | 5 | 87.5 % | 0.808 | 2, 2, 3, 2 | 0.117–0.123 | 1.10–2.80 | 0–0.02 | 0.99–1.04 | +2.338 | walk 230 |
+| v4 | 1 | 22 | 5 | 95.7 % | 0.960 | 2, 3, 3, 2 | 0.052–0.057 | 0.94–2.90 | 0.01–0.07 | 1.6–2.8 | +1.010 | crawl 22 |
+| v4 | 2 | 19 | 7 | 100 % | 0.987 | 2, 2, 3, 3 | 0.051–0.054 | 1.68–3.95 | 0.02–0.09 | 1.4–2.0 | +1.214 | crawl 19 |
+| v4 | 3 | 5 | 1 | 100 % | 0.950 | 1, 1, 2, 2 | 0.055–0.056 | 4.39–4.63 | 0.09–0.12 | 1.3–1.4 | +1.279 | crawl 5 |
+| **v5** | 0 | **903** | **37** | 99.7 % | 0.984 | **5, 6, 7, 5** | 0.049–0.061 | **0.80–4.58** | 0–0.16 | 1.2–3.0 | +1.161 | crawl 902, hop 1 |
+| **v5** | 1 | 67 | 3 | 89.3 % | 0.806 | 2, 2, 3, 2 | 0.118–0.122 | 1.44–2.54 | 0–0.01 | 0.99–1.02 | +2.091 | walk 67 |
+
+**The headline, read honestly: two postures in both archives; v5 doubled the
+coverage of the fixed grid and turned crawl into a continuum; it did not find
+a third.** The pre-registered count says v4 = 4, v5 = 2, and the tables above
+say why that number must not be read as "v4 is more diverse": v4's modes 1–3
+sit at the same trunk height (0.051–0.057 m) and differ along joint speed
+(0.9–2.9 / 1.7–4.0 / 4.4–4.6 rad/s) — the one-genome frequency sweep the
+assessment named, cut into three by a 3-noise threshold because v4 had only
+46 crawlers to fill it. v5 filled it: 903 verified crawlers spanning 0.8–4.6
+rad/s of joint speed, 0–0.16 airborne fraction, 1.2–3.0 mean contacts and
+0.2–5.2 Hz trunk oscillation, **5–7 of 10 bins on every latent axis**, in 37
+fixed cells against v4's 13 (5 + 7 + 1). Connected, it is one mode under a
+connected-components rule, and that is the correct reading of both archives.
+542 of v5's 970 verified elites lie further than eps from *every* v4 elite
+(121 further than 2 eps, max 2.6 eps) — new ground, all of it an extension of
+the crawl posture rather than a new one. **P3 is not met; P8 is not met in
+substance** (the frozen-space mode count was 3 through iterations 5–15 while
+the crawl was still in two pieces, and 2 from iteration 20 once the gap
+closed — it trivially exceeds iteration 0's 0, which was under the 5-elite
+floor, and it never exceeded the seed count in the sense P8 was written for).
+
+**Walk shrank, and that is the cost of the fix in §1.** v5 holds 67 verified
+walkers in 3 fixed cells where v4 holds 230 in 5. The data-driven search
+centroids allocate cells in proportion to the density of viable candidates,
+viable candidates were ~93 % crawl offspring once crawl held ~93 % of the
+parents, so walk's share of the 1,024 search cells fell to a few dozen and
+the sparsity weighting (which puts a lone walker's weight at ~1 against a
+crowded crawler's ~1/n) slowed but did not stop the drift. The best walker
+still clears P6 (+2.091 m vs the 1.5 m floor; v4's +2.338 m was not a target).
+Fix for a v6, not applied here: cap any single mode's share of search cells,
+or allocate centroids by k-means *within* frozen-space clusters.
+
+**Robustness is the clean win.** 98.9 % aggregate against a ≥ 85 % prediction,
+and — reported split, as always — walk 89.3 % and crawl 99.7 %, both above
+their P5 floors (85 / 95). Archive optimism is +0.015 m against v4's
++0.114 m: incumbent re-testing evicted 554 elites over the run and the
+archive's running pass rate ended at 0.993. At *unanimous* 8-of-8 v5 keeps
+838 of 981; v4 keeps 85 of 321.
+
+**Coverage curve on the frozen centroids** (`history.json`): 17 at iteration
+0 (seeds), 27 at iteration 3 (the first iteration after the centroid refit;
+the search archive went 24 → 259 cells in that one iteration), 32 at 11, 42
+at 23, a maximum of 43, and 42 at the end — **a plateau from iteration ~23**,
+which is the measured version of "no new region was being entered". The
+three encoder retrains cost 220 / 359 / 337 elites to re-encoding merges and
+3–4 frozen cells each time; each was regrown within one to two iterations.
+Parent-weight entropy stayed at 0.94–0.96 of uniform: the novelty weighting
+was active but mild at this archive size.
+
+**Predictions, judged.**
+
+| # | prediction | outcome |
+| --- | --- | --- |
+| P1 | walk and crawl recovered unsupervised, ≥ 95 % purity, AE and PCA | **met** — 100 % purity, both encoders (§3) |
+| P2 | 2–4 modes in v4's own data | **met** — 4 (1 walk + a 3-piece crawl sweep) |
+| P3 | ≥ 1 v5 mode no v4 elite falls into | **not met** — 2 modes, both v4's postures; 542 elites beyond eps of v4, all crawl-continuum |
+| P4 | v5 coverage ≥ 1.5 x v4 on the fixed centroids | **met** — 40 vs 20 (2.0 x) |
+| P5 | robustness ≥ 85 % aggregate, walk ≥ 85 %, crawl ≥ 95 % | **met** — 98.9 / 89.3 / 99.7 % |
+| P6 | best walk-like median ≥ 1.5 m | **met** — +2.091 m |
+| P7 | stationarity clause rejects ≤ 5 % of v4's otherwise-viable replicas | **met** — 0.44 % (§3) |
+| P8 | frozen-space mode count rises above iteration 0's by iteration 25 | **not met in substance** — 0 → 3 → 2; never above the seed count of 2 postures |
+
+Six of eight. The two misses are the same miss, and it is the finding of
+the job: **removing the names, the per-mode budget and the label clause, and
+adding novelty pressure, doubled how much of the reachable behaviour space
+the archive holds — and the reachable space, from these seeds and this
+mutation operator, contains two postures.** v2 measured that isotropic
+mutation does not leave the manifold it starts on; v5 measured that a
+learned space and a sparsity bias do not change that. What *did* change is
+the size of the manifold that gets mapped: crawl went from 13 cells in three
+disconnected pieces to 37 cells in one, which is what "maximum diversity at
+okay quality" bought within the two postures that exist. A third posture
+needs a third seed (the roulade checkpoint, a prone-PPO variant) or a
+variation operator that can leave a manifold — not a better descriptor.
+
+One elite to look at: the crawl continuum's edge at `f_air = 0.155` carries
+v4's *hop* label (airborne ≥ 0.16 of the time in some replicas) — a bounding
+crawl, not a hop, but the only verified elite in either archive the v4
+classifier would file outside walk/crawl. Not rendered here (out of scope);
+`qd/render_gaits.py` on `verify_v5/verified.npz` would show it.
+
+#### Reproduction
+
+```bash
+# the rejection audit (~15 min)
+uv run --group qd python -m qd.audit_rejections \
+    --archive-dir qd-run-archives/j007/modes_v4/final --batches 3
+
+# the dataset and the frozen evaluation space (~12 min + 2 min)
+uv run --group qd python -m qd.collect_behaviour --out logs/qd/v5/behaviour_data.npz \
+    --archives v4_walk qd-run-archives/j007/modes_v4/final/archive_walk.npz \
+               v4_crawl qd-run-archives/j007/modes_v4/final/archive_crawl.npz \
+    --seeds walk_seeds qd-run-archives/j004/seeds/ppo_seeds.npz \
+            crawl_seeds qd-run-archives/j007/seeds/crawl_seeds.npz \
+    --random 1024 --jitter 512
+uv run --group qd python -m qd.train_behaviour_space \
+    --data logs/qd/v5/behaviour_data.npz --out logs/qd/v5/space_eval
+
+# the run: 49 x 1024 x 8 replicas = 742k evaluations, 4.6 h
+uv run --group qd python -m qd.pga.run_aurora --iterations 49 --batch-size 1024 \
+    --initial-solutions 1024 --seeding.jitter-count 240 \
+    --seed-genomes walk qd-run-archives/j004/seeds/ppo_seeds.npz \
+                   crawl qd-run-archives/j007/seeds/crawl_seeds_viable.npz \
+    --out-dir logs/qd/aurora_v5
+
+# verification of v5 and v4 on the frozen space (~40 min)
+bash qd/finalize_v5.sh logs/qd/aurora_v5/final.npz logs/qd/v5
+```
+
+Artefacts: `qd-run-archives/j017/` — `aurora_v5/` (run, checkpoints every 5
+iterations, search encoders), `aurora_v5_attempt1/`, `verify_v5/`,
+`verify_v4/`, `space_eval/`, `behaviour_data.npz`, `audit_rejections/`.
+
 ## Watching the gaits
 
 ```bash

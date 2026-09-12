@@ -338,6 +338,25 @@ def insert(archives: ModeArchives, genomes: torch.Tensor, verdict: Verdict) -> d
         "insertion_rate": inserted / total,
         "feasible_rate": float(verdict.viable.mean()),
         "per_mode": per_mode,
+        "rejected_labels": rejected_labels(verdict),
+    }
+
+
+def rejected_labels(verdict: Verdict) -> dict[str, int]:
+    """Modal replica label of every candidate the gate REJECTED, by mode.
+
+    v4 ran 547k rollouts and logged ``per_mode`` only for the viable ones, so
+    whether a roll or a hop ever *appeared* and was then killed by the
+    progress / constancy / agreement clauses was unrecorded (j017's
+    instrumentation gap). The modal label across replicas is well defined for
+    a rejected candidate — :func:`fold_replicas` computes it for everyone —
+    so the count is free. ``qd.audit_rejections`` breaks the same population
+    down per clause.
+    """
+    rejected = ~verdict.viable
+    return {
+        mode: int(np.sum(rejected & (verdict.label == m)))
+        for m, mode in enumerate(MODES)
     }
 
 

@@ -2097,6 +2097,28 @@ holds one can be starved (`LatentArchive.parent_weights`;
 weighting is the explicit novelty pressure. Incumbent re-testing with eviction
 at a 0.60 running pass rate is carried over from v4.
 
+> **Post-registration method change (2026-09-12, 19:05 CEST), recorded so the
+> result cannot be read as tuned.** The paragraph above originally applied the
+> *evaluation* centroids — box-uniform over the training latents — to the
+> search archive as well, and the long run was launched that way at 18:00
+> CEST. Attempt 1 measured why that is wrong for a search archive: the box
+> spans the junk end of the manifold, so the known modes are ~5 cells of walk
+> and ~16 of crawl, and at that resolution walkers were evicted (0.78
+> per-replica pass rate) faster than five cells could hold them. By iteration
+> 5 the archive was 25 cells with 3 walkers; **by iteration 10, 15 cells and 1
+> walker**, and the iteration-10 retrain merged 13 of 28 elites on
+> re-encoding. It was stopped at iteration 11 (1 h in; logs kept at
+> `qd-run-archives/j017/aurora_v5_attempt1/`) and restarted at 19:12 CEST with
+> **search centroids fitted by k-means to the latents of the viable candidates
+> seen so far** (refit at iteration 2 and at every retrain,
+> `run_aurora.search_centroids`) — the standard CVT-MAP-Elites construction
+> when the reachable region is unknown. HQ approved the restart on two
+> conditions, both met here: the change is recorded with the evidence, and no
+> further restart without a blocking report. **Nothing on the evaluation side
+> moved**: the frozen encoder, the 1,024 box-uniform evaluation centroids, the
+> mode rule, the 5-of-8 bar and predictions P1–P8 are as written above, so the
+> results are judged on exactly the grid pre-registered before either attempt.
+
 **Two spaces, one frozen.** The evaluation space is trained once on v4's
 final archives + their seeds + 512 jittered variants + 1024 random MLPs (1,868
 genomes x 8 permuted replicas, `qd/collect_behaviour.py`), its centroid set is

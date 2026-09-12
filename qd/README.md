@@ -2140,9 +2140,79 @@ section is judged against these.
 | P7 | The stationarity clause rejects **≤ 5 %** of the v4 elites' replicas that clear the other clauses at the calibrated `delta_max`. | _pending_ |
 | P8 | The v5 run is **not** a seed-count archive: the mode count on the frozen space rises above the number at iteration 0 by iteration 25. | _pending_ |
 
-### 3. Kill-gate checkpoint
+### 3. Kill-gate checkpoint — the space recovers walk and crawl without being told
 
-_pending — filled in when the space is trained and v4 is re-embedded._
+Dataset: 1,868 genomes x 8 world-permuted replicas (14,944 rows) —
+v4's final walk (263) and crawl (58) archives, their seeds (6 + 5), 512
+jittered variants at σ ∈ {0.005, 0.02, 0.05, 0.1}, and 1,024 random MLPs.
+Under P2'' at 5-of-8: v4 walk **224/263**, v4 crawl **57/58**, jitter
+120/512, random **0/1024**, crawl seeds 0/5 (as j007 measured: only
+`v1_cpg_277` was ever viable, and it is in the archive already).
+
+**The label-free gate is the label gate, measured.** The stationarity clause
+at `delta_max = 0.15` passes **99.56 %** of the v4 elites' replicas that clear
+the other clauses (p50 0.00, p95 0.05, p99 0.08; the 0.44 % above are the
+0.5-deltas of genuine late falls). Verified counts under P2'' equal the counts
+under P2' exactly (224 and 57). **P7 holds** (≤ 5 %).
+
+**Encoders.** AE, L = 4: held-out MSE **0.108** in standardised units (train
+0.092), 400 epochs. PCA at L = 4 explains 63.0 % of variance, reconstruction
+MSE 0.360 — 3.3x worse. Two dead features (the lower-leg geoms never touch
+the ground in this dataset) are zeroed. After noise whitening the spread-to-
+noise ratio per latent axis is **5.8 / 10.8 / 6.8 / 6.7** (AE) and 10.2 /
+14.6 / 5.7 / 2.9 (PCA). Replica noise, measured on 406 viable genomes'
+viable replicas: **1.68** (AE), 1.65 (PCA) — so eps = 5.04 / 4.95.
+
+**v4 re-embedded, frozen AE space, 1,024 fixed centroids, 5-of-8:**
+
+| | AE | PCA (control) |
+| --- | --- | --- |
+| verified elites | 281 / 321 (87.5 %) — walk 85.2 %, crawl 98.3 % | same |
+| coverage, verified | **21 / 1024** (walk 5, crawl 16) | 15 / 1024 |
+| modes (DBSCAN, eps = 3 x noise, ≥ 5 elites) | **4** | 4 |
+| purity vs v4 labels | **100 %** in every mode | 100 % |
+| min inter-mode distance / eps | 2.8 | 3.0 |
+
+Mode composition in the AE space:
+
+| mode | elites | v4 label | trunk z [m] | joint speed [rad/s] | median +x [m] | latent axis bins (of 10) | nearest mode / eps |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 224 | walk 224 | 0.116–0.123 | 1.08–2.80 | 0.61–2.19 | 2, 2, 3, 2 | 4.95 |
+| 1 | 22 | crawl 22 | 0.052–0.057 | 0.92–2.84 | 0.30–1.02 | 2, 3, 2, 2 | 2.80 |
+| 2 | 16 | crawl 16 | 0.051–0.054 | 1.66–3.94 | 0.55–1.21 | 2, 2, 3, 3 | 2.80 |
+| 3 | 5 | crawl 5 | 0.054–0.056 | 4.39–4.64 | 0.84–1.30 | 1, 1, 2, 2 | 5.61 |
+
+**Verdict.** Told nothing, both the AE and its linear control put every walker
+in one cluster and every crawler in another, with no mixing (**P1 holds**, for
+both). The count is 4, inside P2's 2–4, and the extra two are honest about
+what they are: crawl splits along **joint speed** (0.9–2.8 / 1.7–3.9 /
+4.4–4.6 rad/s) at essentially the same trunk height (0.051–0.057 m) — the
+one-genome frequency sweep the assessment described, cut into three pieces by
+a 3-noise threshold. The per-axis table shows it: modes 1–3 each span 1–3
+bins of 10 on every axis, and mode 3 is 5 elites in a 1-bin blob. **This is
+exactly the case the pre-registered rule was built to expose, and the rule
+does expose it** — a count of 4 is reported as *2 postures, one of them a
+3-piece speed sweep*, not as four modes, and the same reading will be applied
+to v5.
+
+Two things this measurement says about the run to come:
+
+* the space has resolution to spare — walk's 224 elites occupy 5 of 1,024
+  cells, crawl's 57 occupy 16. The centroid set spans the whole training box,
+  most of which is junk (random MLPs), so the known modes are small; coverage
+  will be read as a fraction of the same 1,024 for every archive and never
+  summed with anything else;
+* the AE space is the evaluation space (pre-declared default, and its
+  reconstruction is 3.3x better at the same L). PCA agreeing on the
+  separation is the control that says the separation is in the data, not in
+  the non-linearity.
+
+Smoke run of the full v5 loop (3 iterations x 256, one encoder retrain):
+see `qd-run-archives/j017/aurora_smoke/`.
+
+Artefacts: `qd-run-archives/j017/space_eval/` (`space_ae.npz`,
+`space_pca.npz`, `centroids_ae.npz`, `checkpoint.json`, latent scatter
+plots), `qd-run-archives/j017/behaviour_data.npz`.
 
 ### 4. Results
 

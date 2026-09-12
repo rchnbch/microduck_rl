@@ -276,6 +276,11 @@ class PolicyRolloutHarness:
             else None
         )
 
+        self.servo_joint_ids, self.servo_joint_names = self.robot.find_joints(
+            [r"^(?!passive_).*"]
+        )
+        self._servo_ids_t = torch.as_tensor(self.servo_joint_ids, device=cfg.device)
+
         obs, _ = self.env.reset()
         actor_obs = obs["actor"]
         if actor_obs.shape[-1] != spec.obs_dim:
@@ -368,6 +373,25 @@ class PolicyRolloutHarness:
             head_columns=head,
         )
 
+    def make_behaviour_stats(self, windows, cfg=None):
+        """A :class:`qd.behaviour.BehaviourStats` wired to this harness (v5)."""
+        from qd.behaviour import BehaviourStats
+
+        if self.contact_columns is None:
+            raise RuntimeError(
+                "harness was built without mode_channels; the behaviour "
+                "features need per-geom contact"
+            )
+        names, _feet, _head = self.contact_columns
+        return BehaviourStats(
+            self.num_envs,
+            self.device,
+            windows,
+            num_joints=len(self.servo_joint_ids),
+            contact_geom_names=tuple(names),
+            cfg=cfg,
+        )
+
     def close(self) -> None:
         """Drop the env so a second harness can be built in the same process.
 
@@ -388,6 +412,7 @@ class PolicyRolloutHarness:
         on_step=None,
         mode_stats=None,
         mode_reward=None,
+        behaviour_stats=None,
     ) -> tuple[np.ndarray, np.ndarray, dict, Transitions | None]:
         """Evaluate one genome per world and optionally collect transitions.
 
@@ -463,6 +488,8 @@ class PolicyRolloutHarness:
             if mode_stats is None
             else (list(mode_stats) if isinstance(mode_stats, (list, tuple)) else [mode_stats])
         )
+        if behaviour_stats is not None and mode_stats is None:
+            raise ValueError("behaviour_stats needs mode_stats (it shares the accelerometer)")
         if mode_stats is not None:
             from qd.modes import VerticalAccel
 
@@ -470,6 +497,8 @@ class PolicyRolloutHarness:
                 ms.begin(self.base_pos())
             accel = VerticalAccel(self.num_envs, self.device, self.control_dt)
             accel.begin(self.robot.data.root_link_lin_vel_w)
+        if behaviour_stats is not None:
+            behaviour_stats.begin()
 
         # Collected as dense (T, N, ...) stacks and masked ONCE at the end.
         # Masking per step (`obs[was_alive]`) would make the output size depend
@@ -504,6 +533,19 @@ class PolicyRolloutHarness:
                         ch["ang_vel_w"],
                         trunk_az=az,
                         contact_force=ch.get("contact_force"),
+                    )
+                if behaviour_stats is not None:
+                    d = self.robot.data
+                    behaviour_stats.update(
+                        self.base_pos(),
+                        gravity,
+                        ch["lin_vel_w"],
+                        ch["ang_vel_w"],
+                        d.joint_pos[:, self._servo_ids_t],
+                        d.joint_vel[:, self._servo_ids_t],
+                        ch["contact_found"],
+                        ch.get("contact_force"),
+                        az,
                     )
             alive = ~metrics.fallen
             just_fell = was_alive & ~alive
@@ -559,6 +601,8 @@ class PolicyRolloutHarness:
             for i, ms in enumerate(mode_stats):
                 prefix = "mode/" if i == 0 else f"mode{i}/"
                 info.update(ms.finalize().to_info(prefix))
+        if behaviour_stats is not None:
+            info.update(behaviour_stats.finalize().to_info())
         transitions = None
         if collect and buf:
             stacks = [torch.stack(t) for t in zip(*buf)]  # each (T, N, ...)
